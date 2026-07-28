@@ -1,0 +1,11 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+user_databases.json
+channel_subs_cache.json
+user_info_cache.json
+access_grants.json
+bot.log
+.login_state.json
