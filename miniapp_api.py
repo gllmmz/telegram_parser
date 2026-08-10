@@ -240,7 +240,10 @@ def create_app(bot) -> FastAPI:
 
     @app.get("/api/broadcast/candidates")
     async def api_broadcast_candidates(user_id: int = Depends(get_current_user_id)):
-        return {"items": botmod.broadcast_candidates(str(user_id))}
+        return {
+            "items": botmod.broadcast_candidates(str(user_id)),
+            "max_recipients": botmod.MAX_BROADCAST_RECIPIENTS,
+        }
 
     @app.post("/api/broadcast/start")
     async def api_broadcast_start(body: BroadcastStartRequest, user_id: int = Depends(get_current_user_id)):

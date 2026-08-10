@@ -316,6 +316,7 @@
   var bcCandidates = [];
   var bcSelected = {}; // user_id -> true
   var bcPollTimer = null;
+  var bcMaxRecipients = 100; // перезаписывается из /api/broadcast/candidates, это лишь запасное значение
 
   function bcSelectedCount() {
     return Object.keys(bcSelected).length;
@@ -387,6 +388,7 @@
     el.innerHTML = '<div class="empty-state">Загрузка…</div>';
     get("/api/broadcast/candidates").then(function (res) {
       bcCandidates = res.items || [];
+      bcMaxRecipients = res.max_recipients || bcMaxRecipients;
       if (!bcCandidates.length) {
         el.innerHTML = '<div class="empty-state">Пока некому писать — сначала найди кого-то через парсинг.</div>';
         return;
@@ -400,7 +402,13 @@
   document.getElementById("bc-select-next").addEventListener("click", function () {
     var errEl = document.getElementById("bc-select-error");
     errEl.textContent = "";
-    if (!bcSelectedCount()) { errEl.textContent = "Выбери хотя бы одного получателя."; return; }
+    var n = bcSelectedCount();
+    if (!n) { errEl.textContent = "Выбери хотя бы одного получателя."; return; }
+    if (n > bcMaxRecipients) {
+      errEl.textContent = "Выбрано " + n + " — максимум " + bcMaxRecipients + " за раз (чтобы не словить "
+        + "ограничения от Telegram). Сними лишних или разошли несколькими партиями.";
+      return;
+    }
     document.getElementById("bc-select").style.display = "none";
     document.getElementById("bc-compose").style.display = "block";
   });
