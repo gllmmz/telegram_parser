@@ -224,8 +224,24 @@ def save_channel_cache(data):
     with open(CHANNEL_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def _prune_expired_cache(cache: dict, ttl_seconds: float) -> int:
+    """Удаляет протухшие (старше ttl) записи прямо из словаря на месте. Без этого
+    файлы кэша растут бесконечно — просроченная запись всё равно ни на что не
+    влияет (при обращении к ней код просто перезапрашивает данные заново и
+    перезаписывает запись свежей), но продолжает раздувать файл. А каждое
+    сохранение — это deepcopy + полная перезапись ВСЕГО файла на диск, что с
+    каждым днём использования становится всё медленнее."""
+    now = time.time()
+    expired = [k for k, v in cache.items() if now - v.get('ts', 0) >= ttl_seconds]
+    for k in expired:
+        del cache[k]
+    return len(expired)
+
 async def save_channel_cache_async(data):
     async with channel_cache_lock:
+        removed = _prune_expired_cache(data, CHANNEL_CACHE_TTL_SECONDS)
+        if removed:
+            print(f"🧹 channel_subs_cache: удалено {removed} протухших записей")
         snapshot = copy.deepcopy(data)
         await asyncio.to_thread(save_channel_cache, snapshot)
 
@@ -247,6 +263,9 @@ def save_user_cache(data):
 
 async def save_user_cache_async(data):
     async with user_cache_lock:
+        removed = _prune_expired_cache(data, USER_CACHE_TTL_SECONDS)
+        if removed:
+            print(f"🧹 user_info_cache: удалено {removed} протухших записей")
         snapshot = copy.deepcopy(data)
         await asyncio.to_thread(save_user_cache, snapshot)
 
