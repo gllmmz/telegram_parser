@@ -2319,8 +2319,14 @@ async def main():
     )
 
     print("Официальный бот запускается...")
-    await call_with_retry(app.start, "app.start()")
-    await call_with_retry(app.updater.start_polling, "updater.start_polling()")
+    # ВАЖНО: start_polling() запускает фоновый цикл поллинга — если он успел частично
+    # стартовать и всё равно кинул исключение, повторный вызов создаст ВТОРОЙ такой
+    # же цикл в этом же процессе, и они будут бесконечно конфликтовать друг с другом
+    # (Conflict: terminated by other getUpdates request). Поэтому здесь БЕЗ ретрая —
+    # если сеть подвела именно тут, пусть падает весь процесс, а systemd поднимет
+    # его заново с чистого листа (Restart=always в юните).
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
     print("Бот успешно запущен!")
 
     await asyncio.Event().wait()
