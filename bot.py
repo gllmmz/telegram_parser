@@ -1542,16 +1542,37 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CHANNELS
 
 
+def _chunk_parts(parts: list[str], limit: int = 4000, sep: str = "") -> list[str]:
+    """Группирует уже отформатированные HTML-блоки в сообщения ≤limit символов
+    (через sep), никогда не разрезая блок посередине. Наивная нарезка по фиксированной
+    длине рвёт HTML-теги (<b>...</b>) — Telegram в ответ шлёт 'Can't parse entities:
+    can't find end tag' / 'unclosed start tag', и апдейт падает необработанным."""
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for part in parts:
+        extra = len(part) + (len(sep) if current else 0)
+        if current and current_len + extra > limit:
+            chunks.append(sep.join(current))
+            current, current_len, extra = [], 0, len(part)
+        current.append(part)
+        current_len += extra
+    if current:
+        chunks.append(sep.join(current))
+    return chunks
+
+
 def render_parsed_list(user_id_str: str, sort_order: str):
     data = parsed_channels_history.get(user_id_str, [])
     if not data:
         return None
     data = sorted(data, key=lambda x: x.get('last_parsed_at', 0), reverse=(sort_order != 'old'))
-    text = f"📡 <b>Спарсенные каналы</b> ({len(data)} шт.):\n\n"
+    header = f"📡 <b>Спарсенные каналы</b> ({len(data)} шт.):\n\n"
+    entries = []
     for i, item in enumerate(data, 1):
         when = time.strftime('%d.%m.%Y', time.localtime(item.get('last_parsed_at', 0)))
-        text += f"{i}. https://t.me/{html.escape(item['channel'])} — последний раз {when}\n"
-    return text
+        entries.append(f"{i}. https://t.me/{html.escape(item['channel'])} — последний раз {when}\n")
+    return header, entries
 
 
 def render_found_list(user_id_str: str, sort_order: str):
@@ -1559,18 +1580,19 @@ def render_found_list(user_id_str: str, sort_order: str):
     if not data:
         return None
     data = sorted(data, key=lambda x: x.get('found_at', 0), reverse=(sort_order != 'old'))
-    text = f"✨ <b>Найденные каналы</b> ({len(data)} шт.):\n\n"
+    header = f"✨ <b>Найденные каналы</b> ({len(data)} шт.):\n\n"
+    entries = []
     for i, item in enumerate(data, 1):
         name = html.escape(f"{item.get('first_name', '')} {item.get('last_name', '')}".strip()) or "Без имени"
-        uname = f"@{item['username']}" if item.get('username') else f"id{item['user_id']}"
+        uname = html.escape(f"@{item['username']}") if item.get('username') else f"id{item['user_id']}"
         when = time.strftime('%d.%m.%Y %H:%M', time.localtime(item.get('found_at', 0)))
         mark = "✅" if item.get('contacted') else "⬜"
-        text += (
+        entries.append(
             f"{mark} {i}. <b>{name}</b> ({uname})\n"
             f"   Канал: https://t.me/{html.escape(item['channel'])} — {item['subscribers']:,} подп.\n"
             f"   Найден: {when}\n\n"
         )
-    return text
+    return header, entries
 
 
 LIST_RENDERERS = {
@@ -1586,22 +1608,25 @@ async def show_database_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
     user_id_str = str(update.effective_user.id)
 
     renderer, empty_text = LIST_RENDERERS[which]
-    text = renderer(user_id_str, sort_order)
+    result = renderer(user_id_str, sort_order)
 
-    if text is None:
+    if result is None:
         await replace_last_message(
             update, context, 'database_msg_id', empty_text, reply_markup=database_list_keyboard()
         )
         return
 
-    if len(text) > 4000:
+    header, entries = result
+    chunks = _chunk_parts([header] + entries)
+
+    if len(chunks) > 1:
         context.user_data.pop('database_msg_id', None)
-        for i in range(0, len(text), 4000):
-            await update.message.reply_text(text[i:i+4000], parse_mode="HTML")
+        for chunk in chunks:
+            await update.message.reply_text(chunk, parse_mode="HTML")
         await update.message.reply_text("⬆️ Список выше.", reply_markup=database_list_keyboard())
     else:
         await replace_last_message(
-            update, context, 'database_msg_id', text,
+            update, context, 'database_msg_id', chunks[0],
             parse_mode="HTML", reply_markup=database_list_keyboard()
         )
 
@@ -2013,10 +2038,11 @@ async def run_parsing_job(
                 new_count = len(new_pairs)
                 already_count = len(unique) - new_count
                 unique_people = len({r['user_id'] for r in unique})
-                report = [
+                report_header = (
                     f"✅ <b>Найдено {len(unique)} результатов</b> (людей: {unique_people}) "
                     f"(новых: {new_count}, уже было в базе: {already_count}):\n"
-                ]
+                )
+                report_entries = []
                 for i, r in enumerate(unique, 1):
                     status_icon = "✅" if (r['user_id'], r['channel']) in new_pairs else "❌"
                     name = html.escape(f"{r['first_name']} {r['last_name']}".strip()) or "Без имени"
@@ -2031,7 +2057,7 @@ async def run_parsing_job(
                     bio = html.escape(r['bio'][:150])
                     found_when = time.strftime('%d.%m.%Y %H:%M', time.localtime(r.get('found_at', time.time())))
 
-                    report.append(
+                    report_entries.append(
                         f"{status_icon} <b>{i}. {name}</b> ({uname})\n"
                         f"👤 Профиль: {person_link}\n"
                         f"📢 Канал: {channel_link}\n"
@@ -2040,9 +2066,8 @@ async def run_parsing_job(
                         f"📝 Био: {bio}{'...' if len(r['bio']) > 150 else ''}\n"
                     )
 
-                full = "\n".join(report)
-                for i in range(0, len(full), 4000):
-                    await context.bot.send_message(chat_id, full[i:i+4000], parse_mode="HTML")
+                for chunk in _chunk_parts([report_header] + report_entries, sep="\n"):
+                    await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
 
                 await context.bot.send_message(
                     chat_id,
@@ -2052,16 +2077,16 @@ async def run_parsing_job(
                 )
 
             if rejected_list:
-                report = [f"📛 <b>Не подошли по подписчикам ({len(rejected_list)}):</b>\n"]
+                rejected_header = f"📛 <b>Не подошли по подписчикам ({len(rejected_list)}):</b>\n"
+                rejected_entries = []
                 for item in rejected_list:
                     mention = f"упомянут у {item['count']} чел." if item['count'] > 1 else "упомянут у 1 чел."
-                    report.append(
+                    rejected_entries.append(
                         f"@{html.escape(item['channel'])} — <b>{item['subscribers']:,}</b> подп. ({mention})"
                     )
 
-                full = "\n".join(report)
-                for i in range(0, len(full), 4000):
-                    await context.bot.send_message(chat_id, full[i:i+4000], parse_mode="HTML")
+                for chunk in _chunk_parts([rejected_header] + rejected_entries, sep="\n"):
+                    await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
 
         return {'results': unique, 'rejected': rejected_list}
     finally:
