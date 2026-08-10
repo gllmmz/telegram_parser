@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Signal Parser</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css?v=14">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <div id="gate" class="gate" style="display:none">
+    Открой это приложение через кнопку в чате бота в Telegram.
+  </div>
+
+  <div id="main-ui" style="display:none">
+    <div class="topbar">
+      <div class="kicker">Signal Parser</div>
+      <h1 id="topbar-title">Меню</h1>
+    </div>
+    <div class="filmstrip"></div>
+
+    <main>
+
+      <!-- ДАШБОРД -->
+      <section class="screen" id="screen-dashboard">
+        <div class="card">
+          <div class="label">Статус доступа</div>
+          <div class="value-lg" id="dash-status">—</div>
+        </div>
+        <img src="/kusher-logo.png?v=1" class="brand-banner" alt="Kusher">
+        <button class="btn btn-primary" style="margin-bottom:12px" data-nav="parsing">Новый парсинг</button>
+        <button class="btn btn-secondary" style="margin-bottom:12px" data-nav="reparse">Парсинг по найденным каналам</button>
+        <button class="btn btn-secondary" style="margin-bottom:12px" data-nav="database">Моя база каналов</button>
+        <button class="btn btn-secondary" data-nav="account">Аккаунт и тарифы</button>
+      </section>
+
+      <!-- ПАРСИНГ ПО СПАРСЕННЫМ КАНАЛАМ -->
+      <section class="screen" id="screen-reparse">
+        <div class="label">Выбери каналы</div>
+        <div id="reparse-channels" style="margin-bottom:16px"></div>
+        <div class="field">
+          <label>Постов (0–400)</label>
+          <input id="rf-posts" type="number" min="0" max="400" value="50">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Подписчиков от</label>
+            <input id="rf-min" type="number" min="0" value="0">
+          </div>
+          <div class="field">
+            <label>Подписчиков до</label>
+            <input id="rf-max" type="number" min="0" value="10000000">
+          </div>
+        </div>
+        <div id="reparse-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
+        <button class="btn btn-primary" id="rf-submit">Запустить парсинг</button>
+      </section>
+
+      <!-- НОВЫЙ ПАРСИНГ -->
+      <section class="screen" id="screen-parsing">
+        <div id="parsing-form">
+          <div class="field">
+            <label>Каналы</label>
+            <textarea id="pf-channels" placeholder="https://t.me/channel1&#10;@channel2&#10;channel3"></textarea>
+          </div>
+          <div class="field">
+            <label>Постов (0–400)</label>
+            <input id="pf-posts" type="number" min="0" max="400" value="50">
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>Подписчиков от</label>
+              <input id="pf-min" type="number" min="0" value="0">
+            </div>
+            <div class="field">
+              <label>Подписчиков до</label>
+              <input id="pf-max" type="number" min="0" value="10000000">
+            </div>
+          </div>
+          <div id="parsing-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
+          <img src="/kusher-logo.png?v=1" class="brand-banner" alt="Kusher">
+          <button class="btn btn-primary" id="pf-submit">Запустить парсинг</button>
+        </div>
+
+        <div id="parsing-progress" style="display:none">
+          <div class="card">
+            <div class="progress-head">
+              <span class="status-dot"></span>
+              <span class="label" id="pp-label" style="margin:0">Запускаю…</span>
+            </div>
+            <div class="progress-percent" id="pp-percent">0%</div>
+            <div class="progress-bar-track" style="margin:10px 0">
+              <div class="progress-bar-fill" id="pp-fill"></div>
+            </div>
+            <div class="card-row">
+              <span class="value-mono" id="pp-posts">Пост 0 из 0</span>
+              <span class="value-mono" id="pp-found">Найдено: 0</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="parsing-done" style="display:none">
+          <div class="card">
+            <div class="label">Готово</div>
+            <div class="value-lg" id="pd-found">Найдено: 0</div>
+          </div>
+          <div id="pd-results" style="margin-bottom:12px"></div>
+          <div id="pd-rejected-wrap" style="display:none">
+            <div class="label" style="margin:16px 0 8px">Не подошли по подписчикам</div>
+            <div id="pd-rejected" style="margin-bottom:12px"></div>
+          </div>
+          <button class="btn btn-secondary" data-nav="database">Смотреть в базе каналов</button>
+          <button class="btn btn-ghost" id="pd-new">Запустить ещё один парсинг</button>
+        </div>
+      </section>
+
+      <!-- МОЯ БАЗА КАНАЛОВ -->
+      <section class="screen" id="screen-database">
+        <div class="tabs">
+          <button class="tab active" data-db-tab="found">Найденные</button>
+          <button class="tab" data-db-tab="parsed">Спарсенные</button>
+        </div>
+        <div class="toolbar">
+          <button class="btn btn-secondary" id="db-sort">Сначала новые</button>
+          <button class="btn btn-danger" id="db-clear">Очистить</button>
+        </div>
+        <div id="db-confirm" class="card" style="display:none">
+          <div style="margin-bottom:10px">Точно очистить базу? Отменить нельзя.</div>
+          <div class="toolbar">
+            <button class="btn btn-danger" id="db-confirm-yes">Да, очистить</button>
+            <button class="btn btn-ghost" id="db-confirm-no">Отмена</button>
+          </div>
+        </div>
+        <div id="db-list"></div>
+      </section>
+
+      <!-- АККАУНТ / ТАРИФЫ -->
+      <section class="screen" id="screen-account">
+        <div class="card">
+          <div class="label">Статус подписки</div>
+          <div class="value-lg" id="acc-status">—</div>
+        </div>
+        <div class="label" style="margin:16px 0 8px">Тарифы</div>
+        <div id="acc-tariffs"></div>
+        <div class="card" style="margin-top:8px">
+          <div class="label">Поддержка</div>
+          <div class="value-mono">Вопросы и оплата — @kushher</div>
+        </div>
+      </section>
+
+    </main>
+
+    <nav class="bottom-nav">
+      <div class="nav-row">
+        <button class="nav-item active" data-nav="dashboard">Меню</button>
+        <button class="nav-item" data-nav="parsing">Парсинг</button>
+        <button class="nav-item" data-nav="database">Каналы</button>
+        <button class="nav-item" data-nav="account">Аккаунт</button>
+      </div>
+    </nav>
+  </div>
+
+</div>
+<script src="/app.js?v=14"></script>
+</body>
+</html>

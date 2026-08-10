@@ -4,8 +4,10 @@
 __pycache__/
 *.pyc
 user_databases.json
+parsed_channels_history.json
 channel_subs_cache.json
 user_info_cache.json
 access_grants.json
+trial_usage.json
 bot.log
 .login_state.json

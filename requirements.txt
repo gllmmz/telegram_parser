@@ -1,0 +1,5 @@
+python-telegram-bot==22.8
+Telethon==1.44.0
+python-dotenv==1.2.2
+fastapi>=0.115
+uvicorn[standard]>=0.34
