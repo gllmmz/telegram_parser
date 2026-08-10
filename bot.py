@@ -1044,10 +1044,11 @@ def confirm_clear_keyboard():
 
 # ================== UI КОДА ВХОДА ==================
 
-def _code_slots_html(digits: list[str]) -> str:
-    """6 слотов: заполненные цифры и пустые ⬜."""
+def _code_slots_html(digits: list[str], length: int = 5) -> str:
+    """Слоты под цифры кода (заполненные + пустые ⬜). Длина кода у Telegram не
+    фиксирована — обычно 5 цифр, но бывает и иначе (см. sent.type.length)."""
     slots = []
-    for i in range(6):
+    for i in range(length):
         if i < len(digits):
             slots.append(f"<b>{html.escape(digits[i])}</b>")
         else:
@@ -1055,10 +1056,10 @@ def _code_slots_html(digits: list[str]) -> str:
     return "  ".join(slots)
 
 
-def code_prompt_text(digits: list[str]) -> str:
+def code_prompt_text(digits: list[str], length: int = 5) -> str:
     return (
         "🔐 <b>Введите код из Telegram</b>\n\n"
-        f"{_code_slots_html(digits)}\n\n"
+        f"{_code_slots_html(digits, length)}\n\n"
         "Код пришёл в приложение Telegram или по SMS.\n"
         "Нажимайте цифры на клавиатуре ниже."
     )
@@ -1207,10 +1208,15 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         client = await create_login_client(user_id)
         sent = await client.send_code_request(phone)
+        # Длина кода у Telegram не всегда 5 — зависит от способа доставки, сервер
+        # присылает её в sent.type.length. Если атрибута нет (редкие типы вроде
+        # звонка-паттерна) — берём стандартные 5.
+        code_length = getattr(sent.type, 'length', None) or 5
         context.user_data['login_phone'] = phone
         context.user_data['login_phone_code_hash'] = sent.phone_code_hash
         context.user_data['login_client'] = client  # держим до sign_in
         context.user_data['code_digits'] = []
+        context.user_data['code_length'] = code_length
     except PhoneNumberInvalidError:
         await status.edit_text("❌ Неверный номер телефона. Попробуй ещё раз.")
         await context.bot.send_message(
@@ -1241,7 +1247,7 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code_msg = await context.bot.send_message(
         chat_id,
-        code_prompt_text([]),
+        code_prompt_text([], code_length),
         parse_mode="HTML",
         reply_markup=code_keyboard(),
     )
@@ -1276,6 +1282,7 @@ async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     digits: list[str] = context.user_data.setdefault('code_digits', [])
+    code_length = context.user_data.get('code_length', 5)
 
     if text == "⌫":
         if digits:
@@ -1288,16 +1295,16 @@ async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _update_code_message(context, chat_id)
         return CONNECT_CODE
 
-    if len(digits) >= 6:
+    if len(digits) >= code_length:
         return CONNECT_CODE
 
     digits.append(text)
     await _update_code_message(context, chat_id)
 
-    if len(digits) < 6:
+    if len(digits) < code_length:
         return CONNECT_CODE
 
-    # 6 цифр — пробуем войти
+    # набрали нужное число цифр — пробуем войти
     code = "".join(digits)
     phone = context.user_data.get('login_phone')
     phone_code_hash = context.user_data.get('login_phone_code_hash')
@@ -1422,9 +1429,10 @@ async def connect_get_password(update: Update, context: ContextTypes.DEFAULT_TYP
 async def _update_code_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, extra: str = ""):
     code_msg_id = context.user_data.get('code_msg_id')
     digits = context.user_data.get('code_digits', [])
+    code_length = context.user_data.get('code_length', 5)
     if not code_msg_id:
         return
-    text = code_prompt_text(digits) + extra
+    text = code_prompt_text(digits, code_length) + extra
     try:
         await context.bot.edit_message_text(
             text,
@@ -1449,6 +1457,7 @@ async def _cleanup_login(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     context.user_data.pop('login_phone_code_hash', None)
     context.user_data.pop('code_digits', None)
     context.user_data.pop('code_msg_id', None)
+    context.user_data.pop('code_length', None)
     # Неавторизованную сессию удаляем
     if not await is_user_account_connected(user_id):
         _remove_session_files(user_id)
@@ -1476,6 +1485,7 @@ async def _finish_login(update: Update, context: ContextTypes.DEFAULT_TYPE, clie
     context.user_data.pop('login_phone', None)
     context.user_data.pop('login_phone_code_hash', None)
     context.user_data.pop('code_digits', None)
+    context.user_data.pop('code_length', None)
     context.user_data.pop('login_client', None)
 
     await context.bot.send_message(
