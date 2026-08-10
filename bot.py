@@ -1755,6 +1755,11 @@ def _parse_selection(text: str, total: int) -> list[int] | None:
     if text in ("все", "всё", "all"):
         return list(range(1, total + 1))
 
+    # Схлопываем пробелы вокруг тире до разбивки на токены — иначе "1 - 5" (с
+    # пробелами) режется на "1", "-", "5" ещё до проверки на диапазон, и распознать
+    # его как 1-5 уже не получается.
+    text = re.sub(r"\s*-\s*", "-", text)
+
     result: set[int] = set()
     for part in re.split(r"[,\s]+", text):
         if not part:
