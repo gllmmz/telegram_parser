@@ -2270,10 +2270,29 @@ async def main():
 
     if telethon_clients:
         print(f"Запускаю общие Telethon-сессии ({len(telethon_clients)})...")
-        await asyncio.gather(*(
-            start_client(client, name) for client, name in zip(telethon_clients, SESSION_NAMES)
-        ))
-        print("Все общие сессии авторизованы!")
+        # Общие сессии — только запасной пул для админских команд, не критичны для
+        # основного парсинга (он идёт через личный аккаунт пользователя). Поэтому
+        # поломка одной сессии (протухший FloodWait, AuthKeyDuplicatedError и т.п.)
+        # не должна ронять весь процесс — просто выкидываем её из пула.
+        results = await asyncio.gather(
+            *(start_client(client, name) for client, name in zip(telethon_clients, SESSION_NAMES)),
+            return_exceptions=True,
+        )
+        working = []
+        for client, name, result in zip(list(telethon_clients), SESSION_NAMES, results):
+            if isinstance(result, Exception):
+                print(f"⚠️ Общая сессия '{name}' не поднялась, пропускаю: {type(result).__name__}: {result}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            else:
+                working.append(client)
+        telethon_clients[:] = working
+        if working:
+            print(f"Общих сессий поднято: {len(working)}/{len(SESSION_NAMES)}")
+        else:
+            print("⚠️ Ни одна общая сессия не поднялась — парсинг только через личные аккаунты пользователей.")
     else:
         print("Общие Telethon-сессии не заданы (SESSION_NAMES пуст) — парсинг только через личные аккаунты пользователей.")
 
