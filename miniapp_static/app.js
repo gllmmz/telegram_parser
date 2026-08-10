@@ -331,10 +331,13 @@
     var name = ((it.first_name || "") + " " + (it.last_name || "")).trim() || "Без имени";
     var uname = it.username ? "@" + esc(it.username) : "id" + esc(it.user_id);
     var selected = !!bcSelected[it.user_id];
-    var contactedTag = it.contacted ? ' <span class="chip">уже писали</span>' : "";
+    // Не чип (он обрезался бы вместе с текстом из-за white-space:nowrap на .title
+    // при длинных именах) — просто короткая пометка рядом с чекбоксом.
+    var contactedMark = it.contacted ? '<span class="meta" style="flex:none;margin-left:6px">уже писали</span>' : "";
     return '<div class="pick-item' + (selected ? ' selected' : '') + '" data-uid="' + esc(it.user_id) + '">' +
       '<div class="check">' + (selected ? "✓" : "") + '</div>' +
-      '<div class="title">' + esc(name) + ' (' + uname + ')' + contactedTag + '</div>' +
+      '<div class="title">' + esc(name) + ' (' + uname + ')</div>' +
+      contactedMark +
       '</div>';
   }
 
