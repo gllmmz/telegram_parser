@@ -83,6 +83,11 @@ class MarkContactedRequest(BaseModel):
     contacted: bool
 
 
+class BroadcastStartRequest(BaseModel):
+    user_ids: list[int]  # id получателей (broadcast_candidates), не текущего пользователя
+    text: str
+
+
 def create_app(bot) -> FastAPI:
     """bot — экземпляр telegram.Bot (app.bot из main()), нужен для run_parsing_job."""
     app = FastAPI()
@@ -228,6 +233,65 @@ def create_app(bot) -> FastAPI:
 
     @app.get("/api/parsing/status/{job_id}")
     async def api_parsing_status(job_id: str, user_id: int = Depends(get_current_user_id)):
+        job = active_jobs.get(job_id)
+        if job is None or job["user_id"] != user_id:
+            raise HTTPException(404, "Задача не найдена")
+        return job
+
+    @app.get("/api/broadcast/candidates")
+    async def api_broadcast_candidates(user_id: int = Depends(get_current_user_id)):
+        return {"items": botmod.broadcast_candidates(str(user_id))}
+
+    @app.post("/api/broadcast/start")
+    async def api_broadcast_start(body: BroadcastStartRequest, user_id: int = Depends(get_current_user_id)):
+        if not body.text.strip():
+            raise HTTPException(400, "Текст рассылки пустой")
+        if not body.user_ids:
+            raise HTTPException(400, "Не выбраны получатели")
+        if len(body.user_ids) > botmod.MAX_BROADCAST_RECIPIENTS:
+            raise HTTPException(
+                400, f"Слишком много получателей за раз (максимум {botmod.MAX_BROADCAST_RECIPIENTS})"
+            )
+        if not await botmod.is_user_account_connected(user_id):
+            raise HTTPException(403, "Личный аккаунт не подключён")
+
+        by_id = {c["user_id"]: c for c in botmod.broadcast_candidates(str(user_id))}
+        wanted = list(dict.fromkeys(body.user_ids))  # без повторов, порядок сохраняем
+        recipients = [by_id[uid] for uid in wanted if uid in by_id]
+        if not recipients:
+            raise HTTPException(400, "Получатели не найдены в базе")
+
+        _cleanup_old_jobs()
+        job_id = uuid.uuid4().hex
+        active_jobs[job_id] = {
+            "user_id": user_id, "status": "running", "sent": 0, "failed": 0,
+            "total": len(recipients), "done": 0, "stopped_reason": None, "error": None,
+            "created_at": time.time(),
+        }
+
+        def on_progress(snapshot: dict):
+            job = active_jobs.get(job_id)
+            if job is not None:
+                job.update(snapshot)
+
+        async def worker():
+            try:
+                result = await botmod.run_broadcast_job(
+                    user_id, recipients, body.text, on_progress=on_progress
+                )
+                active_jobs[job_id]["status"] = "done"
+                active_jobs[job_id]["sent"] = result["sent"]
+                active_jobs[job_id]["failed"] = result["failed"]
+                active_jobs[job_id]["stopped_reason"] = result.get("stopped_reason")
+            except Exception as e:
+                active_jobs[job_id]["status"] = "error"
+                active_jobs[job_id]["error"] = str(e)
+
+        asyncio.create_task(worker())
+        return {"job_id": job_id}
+
+    @app.get("/api/broadcast/status/{job_id}")
+    async def api_broadcast_status(job_id: str, user_id: int = Depends(get_current_user_id)):
         job = active_jobs.get(job_id)
         if job is None or job["user_id"] != user_id:
             raise HTTPException(404, "Задача не найдена")

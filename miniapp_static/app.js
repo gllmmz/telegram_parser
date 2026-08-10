@@ -123,10 +123,10 @@
   }
 
   // ---------- Навигация ----------
-  var screens = ["dashboard", "parsing", "reparse", "database", "account"];
+  var screens = ["dashboard", "parsing", "reparse", "database", "account", "broadcast"];
   var titles = {
     dashboard: "Меню", parsing: "Новый парсинг", reparse: "Парсинг по каналам",
-    database: "Моя база каналов", account: "Аккаунт",
+    database: "Моя база каналов", account: "Аккаунт", broadcast: "Рассылка",
   };
 
   function showScreen(name) {
@@ -257,8 +257,14 @@
         t.classList.toggle("active", t === el);
       });
       document.getElementById("db-confirm").style.display = "none";
+      document.getElementById("db-broadcast").style.display = dbTab === "found" ? "block" : "none";
       loadDatabase();
     });
+  });
+
+  document.getElementById("db-broadcast").addEventListener("click", function () {
+    showScreen("broadcast");
+    loadBroadcastCandidates();
   });
 
   document.getElementById("db-sort").addEventListener("click", function () {
@@ -281,6 +287,7 @@
   });
 
   function loadDatabase() {
+    document.getElementById("db-broadcast").style.display = dbTab === "found" ? "block" : "none";
     var listEl = document.getElementById("db-list");
     listEl.innerHTML = '<div class="empty-state">Загрузка…</div>';
     var path = "/api/database/" + dbTab + "?sort=" + dbSort;
@@ -303,6 +310,158 @@
     }).catch(function (e) {
       listEl.innerHTML = '<div class="empty-state">Ошибка: ' + esc(e.message) + '</div>';
     });
+  }
+
+  // ---------- Рассылка ----------
+  var bcCandidates = [];
+  var bcSelected = {}; // user_id -> true
+  var bcPollTimer = null;
+
+  function bcSelectedCount() {
+    return Object.keys(bcSelected).length;
+  }
+
+  function bcUpdateCounters() {
+    var n = bcSelectedCount();
+    document.getElementById("bc-select-count").textContent = n;
+    document.getElementById("bc-compose-count").textContent = n;
+  }
+
+  function renderBroadcastCandidate(it) {
+    var name = ((it.first_name || "") + " " + (it.last_name || "")).trim() || "Без имени";
+    var uname = it.username ? "@" + esc(it.username) : "id" + esc(it.user_id);
+    var selected = !!bcSelected[it.user_id];
+    var contactedTag = it.contacted ? ' <span class="chip">уже писали</span>' : "";
+    return '<div class="pick-item' + (selected ? ' selected' : '') + '" data-uid="' + esc(it.user_id) + '">' +
+      '<div class="check">' + (selected ? "✓" : "") + '</div>' +
+      '<div class="title">' + esc(name) + ' (' + uname + ')' + contactedTag + '</div>' +
+      '</div>';
+  }
+
+  function bcRenderCandidates() {
+    var el = document.getElementById("bc-candidates");
+    el.innerHTML = bcCandidates.map(renderBroadcastCandidate).join("");
+    bcUpdateCounters();
+  }
+
+  document.getElementById("bc-candidates").addEventListener("click", function (e) {
+    var row = e.target.closest(".pick-item");
+    if (!row) return;
+    var uid = row.getAttribute("data-uid");
+    if (bcSelected[uid]) delete bcSelected[uid];
+    else bcSelected[uid] = true;
+    row.classList.toggle("selected");
+    row.querySelector(".check").textContent = bcSelected[uid] ? "✓" : "";
+    bcUpdateCounters();
+  });
+
+  document.getElementById("bc-select-all").addEventListener("click", function () {
+    bcSelected = {};
+    bcCandidates.forEach(function (it) { bcSelected[it.user_id] = true; });
+    bcRenderCandidates();
+  });
+
+  document.getElementById("bc-select-none").addEventListener("click", function () {
+    bcSelected = {};
+    bcRenderCandidates();
+  });
+
+  function resetBroadcastScreen() {
+    document.getElementById("bc-select").style.display = "block";
+    document.getElementById("bc-compose").style.display = "none";
+    document.getElementById("bc-progress").style.display = "none";
+    document.getElementById("bc-done").style.display = "none";
+    document.getElementById("bc-select-error").textContent = "";
+    document.getElementById("bc-compose-error").textContent = "";
+    document.getElementById("bc-text").value = "";
+    if (bcPollTimer) { clearInterval(bcPollTimer); bcPollTimer = null; }
+  }
+
+  function loadBroadcastCandidates() {
+    resetBroadcastScreen();
+    bcSelected = {};
+    var el = document.getElementById("bc-candidates");
+    el.innerHTML = '<div class="empty-state">Загрузка…</div>';
+    get("/api/broadcast/candidates").then(function (res) {
+      bcCandidates = res.items || [];
+      if (!bcCandidates.length) {
+        el.innerHTML = '<div class="empty-state">Пока некому писать — сначала найди кого-то через парсинг.</div>';
+        return;
+      }
+      bcRenderCandidates();
+    }).catch(function (e) {
+      el.innerHTML = '<div class="empty-state">Ошибка: ' + esc(e.message) + '</div>';
+    });
+  }
+
+  document.getElementById("bc-select-next").addEventListener("click", function () {
+    var errEl = document.getElementById("bc-select-error");
+    errEl.textContent = "";
+    if (!bcSelectedCount()) { errEl.textContent = "Выбери хотя бы одного получателя."; return; }
+    document.getElementById("bc-select").style.display = "none";
+    document.getElementById("bc-compose").style.display = "block";
+  });
+
+  document.getElementById("bc-compose-back").addEventListener("click", function () {
+    document.getElementById("bc-compose").style.display = "none";
+    document.getElementById("bc-select").style.display = "block";
+  });
+
+  document.getElementById("bc-send").addEventListener("click", function () {
+    var errEl = document.getElementById("bc-compose-error");
+    errEl.textContent = "";
+    var text = document.getElementById("bc-text").value.trim();
+    if (!text) { errEl.textContent = "Напиши текст рассылки."; return; }
+
+    var userIds = Object.keys(bcSelected).map(Number);
+    var btn = this;
+    btn.disabled = true;
+    post("/api/broadcast/start", { user_ids: userIds, text: text }).then(function (res) {
+      btn.disabled = false;
+      document.getElementById("bc-compose").style.display = "none";
+      document.getElementById("bc-progress").style.display = "block";
+      bcPollJob(res.job_id);
+    }).catch(function (e) {
+      btn.disabled = false;
+      errEl.textContent = e.message;
+    });
+  });
+
+  function bcPollJob(jobId) {
+    if (bcPollTimer) clearInterval(bcPollTimer);
+    bcPollTimer = setInterval(function () {
+      get("/api/broadcast/status/" + jobId).then(function (job) {
+        var total = job.total || 0;
+        var done = job.done || 0;
+        var percent = total ? Math.round((done / total) * 100) : 0;
+        document.getElementById("bc-fill").style.width = percent + "%";
+        document.getElementById("bc-percent").textContent = percent + "%";
+        document.getElementById("bc-progress-done").textContent = done + " из " + total;
+        document.getElementById("bc-progress-stats").textContent =
+          "успешно " + (job.sent || 0) + " · ошибок " + (job.failed || 0);
+
+        if (job.status === "done" || job.status === "error") {
+          clearInterval(bcPollTimer);
+          bcPollTimer = null;
+          document.getElementById("bc-progress").style.display = "none";
+          document.getElementById("bc-done").style.display = "block";
+
+          if (job.status === "error") {
+            document.getElementById("bc-done-summary").textContent = "Ошибка рассылки";
+            document.getElementById("bc-done-reason").textContent = job.error || "неизвестная ошибка";
+          } else {
+            document.getElementById("bc-done-summary").textContent =
+              "Отправлено: " + (job.sent || 0) + " · ошибок: " + (job.failed || 0);
+            var reasons = {
+              peer_flood: "⚠️ Telegram посчитал рассылку похожей на спам — остановили сами, чтобы не рисковать аккаунтом.",
+              flood_wait: "⏳ Остановлено из-за долгого лимита от Telegram (FloodWait).",
+              no_client: "❌ Личный аккаунт не подключён.",
+            };
+            document.getElementById("bc-done-reason").textContent = reasons[job.stopped_reason] || "";
+          }
+        }
+      }).catch(function () { /* сеть моргнула — подождём следующего тика */ });
+    }, 1500);
   }
 
   // ---------- Парсинг по найденным каналам ----------

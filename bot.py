@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import html
+import random
 import re
 import json
 import os
@@ -17,6 +18,7 @@ from telethon.errors import (
     FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError,
     MsgIdInvalidError, PhoneNumberInvalidError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError,
+    PeerFloodError,
 )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
@@ -76,6 +78,16 @@ MAX_CONCURRENT_PARSES = 8
 CALL_TIMEOUT = 60
 MAX_FLOOD_WAIT = 120
 
+# Рассылка найденным людям — идёт через личный аккаунт пользователя (Bot API не может
+# написать первым тому, кто не писал боту). Это реальные сообщения незнакомым людям,
+# поэтому: задержка между отправками (не быстрее, чем живой человек тыкает "написать"),
+# жёсткий потолок получателей за один прогон, и немедленная остановка при PeerFloodError
+# (Telegram явно сигналит "хватит спамить" — продолжать значит рисковать аккаунтом).
+MAX_BROADCAST_RECIPIENTS = 100
+BROADCAST_DELAY_MIN = 4.0
+BROADCAST_DELAY_MAX = 9.0
+BROADCAST_EDIT_INTERVAL = 2.0
+
 # Папка с сессиями пользователей (каждый user_id → свой .session файл)
 USER_SESSIONS_DIR = Path("user_sessions")
 USER_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,6 +96,7 @@ USER_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # Состояния диалогов
 CHANNELS, POSTS, SUBS_RANGE = range(3)
 CONNECT_PHONE, CONNECT_CODE, CONNECT_PASSWORD = range(3, 6)
+BROADCAST_SELECT, BROADCAST_TEXT, BROADCAST_CONFIRM = range(6, 9)
 
 telethon_clients = [
     TelegramClient(name, API_ID, API_HASH, connection_retries=10, retry_delay=3)
@@ -1018,11 +1031,11 @@ def database_submenu_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-def database_list_keyboard():
-    keyboard = [
-        [KeyboardButton("🔀 Сортировка"), KeyboardButton("🗑 Очистить базу")],
-        [KeyboardButton("◀️ Назад")]
-    ]
+def database_list_keyboard(which: str = 'found'):
+    keyboard = [[KeyboardButton("🔀 Сортировка"), KeyboardButton("🗑 Очистить базу")]]
+    if which == 'found':
+        keyboard.append([KeyboardButton("📣 Рассылка")])
+    keyboard.append([KeyboardButton("◀️ Назад")])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -1612,7 +1625,7 @@ async def show_database_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     if result is None:
         await replace_last_message(
-            update, context, 'database_msg_id', empty_text, reply_markup=database_list_keyboard()
+            update, context, 'database_msg_id', empty_text, reply_markup=database_list_keyboard(which)
         )
         return
 
@@ -1623,11 +1636,11 @@ async def show_database_list(update: Update, context: ContextTypes.DEFAULT_TYPE,
         context.user_data.pop('database_msg_id', None)
         for chunk in chunks:
             await update.message.reply_text(chunk, parse_mode="HTML")
-        await update.message.reply_text("⬆️ Список выше.", reply_markup=database_list_keyboard())
+        await update.message.reply_text("⬆️ Список выше.", reply_markup=database_list_keyboard(which))
     else:
         await replace_last_message(
             update, context, 'database_msg_id', chunks[0],
-            parse_mode="HTML", reply_markup=database_list_keyboard()
+            parse_mode="HTML", reply_markup=database_list_keyboard(which)
         )
 
 
@@ -1719,6 +1732,189 @@ async def database_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         which = context.user_data.get('db_current_list', 'found')
         await show_database_list(update, context, which)
+
+
+# ================== РАССЫЛКА ==================
+
+def _broadcast_select_prompt(candidates: list[dict]) -> list[str]:
+    header = f"📣 <b>Рассылка</b> — выбери получателей ({len(candidates)} чел.):\n\n"
+    entries = []
+    for i, item in enumerate(candidates, 1):
+        name = html.escape(f"{item.get('first_name', '')} {item.get('last_name', '')}".strip()) or "Без имени"
+        uname = f"@{item['username']}" if item.get('username') else f"id{item['user_id']}"
+        mark = "✅" if item.get('contacted') else "⬜"
+        entries.append(f"{mark} {i}. {name} ({html.escape(uname)})\n")
+    return _chunk_parts([header] + entries)
+
+
+def _parse_selection(text: str, total: int) -> list[int] | None:
+    """Парсит '1,3,5-9' / 'все' в отсортированный список уникальных индексов (1-based).
+    None, если не распознано ни одного валидного номера."""
+    text = text.strip().lower()
+    if text in ("все", "всё", "all"):
+        return list(range(1, total + 1))
+
+    result: set[int] = set()
+    for part in re.split(r"[,\s]+", text):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > b:
+                a, b = b, a
+            result.update(n for n in range(a, b + 1) if 1 <= n <= total)
+        elif part.isdigit():
+            n = int(part)
+            if 1 <= n <= total:
+                result.add(n)
+    return sorted(result) if result else None
+
+
+async def start_broadcast_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    which = context.user_data.get('db_current_list', 'found')
+
+    if which != 'found':
+        await update.message.reply_text("📣 Рассылка доступна только для раздела «Найденные каналы».")
+        return ConversationHandler.END
+
+    if not await is_user_account_connected(user_id):
+        await update.message.reply_text("🔌 Сначала подключите личный аккаунт.\nНажми /start")
+        return ConversationHandler.END
+
+    candidates = broadcast_candidates(str(user_id))
+    if not candidates:
+        await update.message.reply_text("✨ Здесь пока пусто — сначала запусти парсинг и найди кого-то.")
+        return ConversationHandler.END
+
+    context.user_data['broadcast_candidates'] = candidates
+    context.user_data.pop('database_msg_id', None)
+
+    for chunk in _broadcast_select_prompt(candidates):
+        await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+
+    await context.bot.send_message(
+        chat_id,
+        "Напиши номера через запятую и/или диапазоны (например: <code>1,3,5-9</code>) "
+        f"или слово «все» (максимум {MAX_BROADCAST_RECIPIENTS} за раз).",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+    return BROADCAST_SELECT
+
+
+async def connect_broadcast_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "❌ Отмена":
+        context.user_data.pop('broadcast_candidates', None)
+        await update.message.reply_text("Рассылка отменена.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    candidates = context.user_data.get('broadcast_candidates', [])
+    indices = _parse_selection(text, len(candidates))
+
+    if not indices:
+        await update.message.reply_text(
+            "Не понял выбор. Пришли номера через запятую и/или диапазоны "
+            "(например 1,3,5-9) или слово «все».",
+            reply_markup=cancel_keyboard(),
+        )
+        return BROADCAST_SELECT
+
+    if len(indices) > MAX_BROADCAST_RECIPIENTS:
+        await update.message.reply_text(
+            f"⚠️ Выбрано слишком много ({len(indices)} чел.) — за один раз можно не "
+            f"больше {MAX_BROADCAST_RECIPIENTS}, чтобы не словить ограничения от "
+            f"Telegram. Сократи диапазон и пришли ещё раз.",
+            reply_markup=cancel_keyboard(),
+        )
+        return BROADCAST_SELECT
+
+    context.user_data['broadcast_selected'] = [candidates[i - 1] for i in indices]
+    context.user_data.pop('broadcast_candidates', None)
+    await update.message.reply_text(
+        f"Выбрано: {len(indices)} чел.\n\nНапиши текст рассылки обычным сообщением:",
+        reply_markup=cancel_keyboard(),
+    )
+    return BROADCAST_TEXT
+
+
+async def connect_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "❌ Отмена":
+        context.user_data.pop('broadcast_selected', None)
+        await update.message.reply_text("Рассылка отменена.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    if not text:
+        await update.message.reply_text("Текст пустой — пришли ещё раз.", reply_markup=cancel_keyboard())
+        return BROADCAST_TEXT
+
+    selected = context.user_data.get('broadcast_selected', [])
+    context.user_data['broadcast_text'] = text
+    preview = text if len(text) <= 500 else text[:500] + "…"
+
+    await update.message.reply_text(
+        f"📣 Разослать этот текст {len(selected)} получателям?\n\n"
+        f"—————\n{preview}\n—————\n\n"
+        "⚠️ Это реальные сообщения с твоего личного Telegram-аккаунта людям, которые "
+        "тебе не писали. Отправляем с паузами между сообщениями и сразу остановимся, "
+        "если Telegram сам просигналит, что это похоже на спам — но риск ограничений "
+        "на аккаунт всё равно есть, особенно при частых больших рассылках.",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("✅ Разослать")], [KeyboardButton("❌ Отмена")]], resize_keyboard=True
+        ),
+    )
+    return BROADCAST_CONFIRM
+
+
+async def connect_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if text != "✅ Разослать":
+        context.user_data.pop('broadcast_selected', None)
+        context.user_data.pop('broadcast_text', None)
+        await update.message.reply_text("Рассылка отменена.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    selected = context.user_data.pop('broadcast_selected', [])
+    broadcast_text = context.user_data.pop('broadcast_text', '')
+
+    if not selected or not broadcast_text:
+        await update.message.reply_text(
+            "❌ Сессия рассылки потеряна, начни заново.", reply_markup=main_menu_keyboard()
+        )
+        return ConversationHandler.END
+
+    status_msg = await update.message.reply_text(
+        f"📣 Отправляю 0 из {len(selected)}…", reply_markup=ReplyKeyboardRemove()
+    )
+
+    result = await run_broadcast_job(user_id, selected, broadcast_text, status_msg=status_msg)
+
+    reason_text = {
+        'peer_flood': (
+            "\n\n⚠️ Telegram посчитал рассылку похожей на спам и мы сами остановили "
+            "отправку — дальше слать не стали, чтобы не рисковать аккаунтом."
+        ),
+        'flood_wait': "\n\n⏳ Остановлено из-за долгого лимита от Telegram (FloodWait).",
+        'no_client': "\n\n❌ Личный аккаунт не подключён.",
+    }.get(result.get('stopped_reason'), "")
+
+    try:
+        await status_msg.edit_text(
+            f"✅ Рассылка завершена.\nОтправлено: {result['sent']}\nОшибок: {result['failed']}{reason_text}"
+        )
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id, "Готово 👇", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
 
 
 async def account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2093,6 +2289,104 @@ async def run_parsing_job(
         active_parses -= 1
 
 
+def broadcast_candidates(user_id_str: str) -> list[dict]:
+    """Уникальные люди (по user_id) из базы найденных — один и тот же человек мог
+    найтись через разные каналы, но писать ему в рассылке нужно только один раз."""
+    seen: dict[int, dict] = {}
+    for item in user_databases.get(user_id_str, []):
+        uid = item['user_id']
+        if uid not in seen or item.get('found_at', 0) > seen[uid].get('found_at', 0):
+            seen[uid] = item
+    return sorted(seen.values(), key=lambda x: x.get('found_at', 0), reverse=True)
+
+
+async def run_broadcast_job(
+    user_id: int, recipients: list[dict], text: str,
+    *, status_msg=None, on_progress: "callable | None" = None,
+) -> dict:
+    """Рассылает text каждому получателю личным сообщением через личный Telethon-
+    аккаунт пользователя (Bot API так не может — бот не имеет права писать первым
+    тому, кто с ним не переписывался). status_msg — сообщение бота, которое живьём
+    редактируем прогрессом; on_progress — синхронный колбэк для мини-аппа (job dict)."""
+    client = await get_user_client(user_id)
+    if client is None:
+        return {'sent': 0, 'failed': 0, 'stopped_reason': 'no_client', 'errors': []}
+
+    user_id_str = str(user_id)
+    total = len(recipients)
+    sent = failed = 0
+    errors: list[str] = []
+    stopped_reason = None
+    contacted_ids: set[int] = set()
+    last_edit = 0.0
+
+    async def report(done: int, force: bool = False):
+        nonlocal last_edit
+        if on_progress:
+            try:
+                on_progress({'sent': sent, 'failed': failed, 'total': total, 'done': done})
+            except Exception as e:
+                print(f"⚠️ broadcast on_progress: {e}")
+        if status_msg is not None:
+            now = time.monotonic()
+            if force or now - last_edit >= BROADCAST_EDIT_INTERVAL:
+                last_edit = now
+                try:
+                    await status_msg.edit_text(
+                        f"📣 Отправляю {done} из {total}… (успешно: {sent}, ошибок: {failed})"
+                    )
+                except Exception:
+                    pass
+
+    for idx, r in enumerate(recipients, 1):
+        try:
+            await with_timeout(client.send_message(r['user_id'], text), f"broadcast({r['user_id']})")
+            sent += 1
+            contacted_ids.add(r['user_id'])
+        except PeerFloodError:
+            # Telegram явно сигналит "хватит писать незнакомцам" — продолжать значит
+            # рисковать ограничением личного аккаунта пользователя. Останавливаемся.
+            stopped_reason = 'peer_flood'
+            await report(idx, force=True)
+            break
+        except FloodWaitError as e:
+            if await sleep_flood_wait(e.seconds, f"broadcast({r['user_id']})"):
+                try:
+                    await with_timeout(
+                        client.send_message(r['user_id'], text), f"broadcast retry({r['user_id']})"
+                    )
+                    sent += 1
+                    contacted_ids.add(r['user_id'])
+                except Exception as e2:
+                    failed += 1
+                    errors.append(f"{r.get('username') or r['user_id']}: {e2}")
+            else:
+                stopped_reason = 'flood_wait'
+                await report(idx, force=True)
+                break
+        except Exception as e:
+            failed += 1
+            errors.append(f"{r.get('username') or r['user_id']}: {type(e).__name__}: {e}")
+            print(f"⚠️ broadcast({r['user_id']}): {type(e).__name__}: {e}")
+
+        await report(idx, force=(idx == total))
+
+        if idx < total and stopped_reason is None:
+            await asyncio.sleep(random.uniform(BROADCAST_DELAY_MIN, BROADCAST_DELAY_MAX))
+
+    if contacted_ids:
+        items = user_databases.get(user_id_str, [])
+        changed = False
+        for item in items:
+            if item['user_id'] in contacted_ids and not item.get('contacted'):
+                item['contacted'] = True
+                changed = True
+        if changed:
+            await save_databases_async(user_databases)
+
+    return {'sent': sent, 'failed': failed, 'stopped_reason': stopped_reason, 'errors': errors[:10]}
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await parsing_step_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
@@ -2227,6 +2521,7 @@ async def main():
             MessageHandler(filters.Regex("^✅ Я подписался$"), start),
             MessageHandler(filters.Regex("^🔍 Новый парсинг$"), new_parsing),
             CommandHandler("parsing", new_parsing),
+            MessageHandler(filters.Regex("^📣 Рассылка$"), start_broadcast_select),
         ],
         states={
             CONNECT_PHONE: [
@@ -2242,6 +2537,9 @@ async def main():
             CHANNELS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_channels)],
             POSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_posts)],
             SUBS_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_subs_range)],
+            BROADCAST_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_selection)],
+            BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_text)],
+            BROADCAST_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_confirm)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),

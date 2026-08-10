@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css?v=14">
+<link rel="stylesheet" href="/style.css?v=15">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
@@ -129,6 +129,7 @@
           <button class="btn btn-secondary" id="db-sort">Сначала новые</button>
           <button class="btn btn-danger" id="db-clear">Очистить</button>
         </div>
+        <button class="btn btn-primary" id="db-broadcast" style="display:none;margin-bottom:12px">📣 Рассылка</button>
         <div id="db-confirm" class="card" style="display:none">
           <div style="margin-bottom:10px">Точно очистить базу? Отменить нельзя.</div>
           <div class="toolbar">
@@ -137,6 +138,64 @@
           </div>
         </div>
         <div id="db-list"></div>
+      </section>
+
+      <!-- РАССЫЛКА -->
+      <section class="screen" id="screen-broadcast">
+
+        <div id="bc-select">
+          <div class="label">Выбери получателей</div>
+          <div class="toolbar">
+            <button class="btn btn-secondary" id="bc-select-all">Выбрать всех</button>
+            <button class="btn btn-secondary" id="bc-select-none">Снять всё</button>
+          </div>
+          <div id="bc-candidates"></div>
+          <div id="bc-select-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
+          <button class="btn btn-primary" id="bc-select-next">Далее (<span id="bc-select-count">0</span>)</button>
+        </div>
+
+        <div id="bc-compose" style="display:none">
+          <div class="field">
+            <label>Текст рассылки</label>
+            <textarea id="bc-text" placeholder="Привет! ..."></textarea>
+          </div>
+          <div class="card" style="border-color:var(--error)">
+            ⚠️ Это реальные сообщения с твоего личного Telegram-аккаунта людям, которые
+            тебе не писали. Отправляем с паузами между сообщениями и остановимся сами,
+            если Telegram просигналит, что это похоже на спам — но риск ограничений на
+            аккаунт всё равно есть, особенно при частых больших рассылках.
+          </div>
+          <div id="bc-compose-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
+          <button class="btn btn-primary" id="bc-send" style="margin-bottom:8px">Разослать (<span id="bc-compose-count">0</span>)</button>
+          <button class="btn btn-ghost" id="bc-compose-back">Назад к выбору</button>
+        </div>
+
+        <div id="bc-progress" style="display:none">
+          <div class="card">
+            <div class="progress-head">
+              <span class="status-dot"></span>
+              <span class="label" style="margin:0">Рассылаю…</span>
+            </div>
+            <div class="progress-percent" id="bc-percent">0%</div>
+            <div class="progress-bar-track" style="margin:10px 0">
+              <div class="progress-bar-fill" id="bc-fill"></div>
+            </div>
+            <div class="card-row">
+              <span class="value-mono" id="bc-progress-done">0 из 0</span>
+              <span class="value-mono" id="bc-progress-stats">успешно 0 · ошибок 0</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="bc-done" style="display:none">
+          <div class="card">
+            <div class="label">Готово</div>
+            <div class="value-lg" id="bc-done-summary">—</div>
+            <div class="value-mono" id="bc-done-reason"></div>
+          </div>
+          <button class="btn btn-secondary" data-nav="database">К базе каналов</button>
+        </div>
+
       </section>
 
       <!-- АККАУНТ / ТАРИФЫ -->
@@ -166,6 +225,6 @@
   </div>
 
 </div>
-<script src="/app.js?v=14"></script>
+<script src="/app.js?v=15"></script>
 </body>
 </html>
