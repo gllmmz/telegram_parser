@@ -77,6 +77,7 @@ PROGRESS_EDIT_INTERVAL = 1.2
 MAX_CONCURRENT_PARSES = 8
 CALL_TIMEOUT = 60
 MAX_FLOOD_WAIT = 120
+MAX_CHANNELS_PER_PARSE = 30  # тот же лимит, что и в мини-аппе (miniapp_api.MAX_CHANNELS_PER_JOB)
 
 # Рассылка найденным людям — идёт через личный аккаунт пользователя (Bot API не может
 # написать первым тому, кто не писал боту). Это реальные сообщения незнакомым людям,
@@ -2000,7 +2001,17 @@ async def get_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await parsing_step_reply(update, context, "Не нашёл ссылок. Попробуй ещё раз или нажми ❌ Отмена.", reply_markup=cancel_keyboard())
         return CHANNELS
 
-    context.user_data['channels'] = list(dict.fromkeys(links))
+    links = list(dict.fromkeys(links))
+    if len(links) > MAX_CHANNELS_PER_PARSE:
+        await parsing_step_reply(
+            update, context,
+            f"Слишком много каналов за раз ({len(links)}) — максимум {MAX_CHANNELS_PER_PARSE}. "
+            "Пришли поменьше или раздели на несколько запусков.",
+            reply_markup=cancel_keyboard(),
+        )
+        return CHANNELS
+
+    context.user_data['channels'] = links
     await parsing_step_reply(
         update, context,
         f"Каналы: {', '.join('@'+c for c in context.user_data['channels'])}\n\n"
@@ -2221,8 +2232,10 @@ async def run_parsing_job(
         rejected_list = sorted(rejected.values(), key=lambda x: x['subscribers'], reverse=True)
 
         if notify_chat:
-            debug_text = html.escape("\n".join(debug_info))
-            await context.bot.send_message(chat_id, f"📊 <b>Статистика:</b>\n{debug_text}", parse_mode="HTML")
+            debug_header = "📊 <b>Статистика:</b>\n"
+            debug_entries = [html.escape(line) + "\n" for line in debug_info]
+            for chunk in _chunk_parts([debug_header] + debug_entries, sep=""):
+                await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
 
             if not unique:
                 await context.bot.send_message(
