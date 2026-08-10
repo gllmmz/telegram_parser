@@ -7,7 +7,9 @@ import json
 import os
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.functions.channels import GetFullChannelRequest
@@ -78,6 +80,11 @@ MAX_CONCURRENT_PARSES = 8
 CALL_TIMEOUT = 60
 MAX_FLOOD_WAIT = 120
 MAX_CHANNELS_PER_PARSE = 30  # тот же лимит, что и в мини-аппе (miniapp_api.MAX_CHANNELS_PER_JOB)
+
+# Все даты/время в текстах бота — по московскому времени, независимо от того, в какой
+# таймзоне физически стоит сервер (были случаи переезда между серверами в разных
+# таймзонах — без этого даты в чате бота молча сдвигались на часы).
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 # Рассылка найденным людям — идёт через личный аккаунт пользователя (Bot API не может
 # написать первым тому, кто не писал боту). Это реальные сообщения незнакомым людям,
@@ -338,7 +345,7 @@ def access_status_text(user_id: int) -> str:
 
     grant = access_grants.get(str(user_id))
     if grant is not None and time.time() < grant['until']:
-        until_str = time.strftime('%d.%m.%Y', time.localtime(grant['until']))
+        until_str = fmt_date(grant['until'])
         days = int((grant['until'] - time.time()) // 86400) + 1
         return f"Активна до {until_str} (осталось ~{days} дн.)"
 
@@ -347,7 +354,7 @@ def access_status_text(user_id: int) -> str:
         return f"Бесплатных запросов осталось: {trials_left} из {FREE_TRIAL_LIMIT}"
 
     if grant is not None:
-        until_str = time.strftime('%d.%m.%Y', time.localtime(grant['until']))
+        until_str = fmt_date(grant['until'])
         return f"Подписка истекла {until_str}. Для продления — /tariffs"
 
     return "Бесплатные запросы закончились. Для оформления подписки — /tariffs"
@@ -652,6 +659,16 @@ def format_duration(seconds: float) -> str:
     if m:
         return f"{m}м {s}с"
     return f"{s}с"
+
+
+def fmt_date(ts: float) -> str:
+    """Дата по московскому времени, независимо от таймзоны сервера."""
+    return datetime.fromtimestamp(ts, MOSCOW_TZ).strftime('%d.%m.%Y')
+
+
+def fmt_datetime(ts: float) -> str:
+    """Дата+время по московскому времени, независимо от таймзоны сервера."""
+    return datetime.fromtimestamp(ts, MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')
 
 
 class ProgressTracker:
@@ -1584,7 +1601,7 @@ def render_parsed_list(user_id_str: str, sort_order: str):
     header = f"📡 <b>Спарсенные каналы</b> ({len(data)} шт.):\n\n"
     entries = []
     for i, item in enumerate(data, 1):
-        when = time.strftime('%d.%m.%Y', time.localtime(item.get('last_parsed_at', 0)))
+        when = fmt_date(item.get('last_parsed_at', 0))
         entries.append(f"{i}. https://t.me/{html.escape(item['channel'])} — последний раз {when}\n")
     return header, entries
 
@@ -1599,7 +1616,7 @@ def render_found_list(user_id_str: str, sort_order: str):
     for i, item in enumerate(data, 1):
         name = html.escape(f"{item.get('first_name', '')} {item.get('last_name', '')}".strip()) or "Без имени"
         uname = html.escape(f"@{item['username']}") if item.get('username') else f"id{item['user_id']}"
-        when = time.strftime('%d.%m.%Y %H:%M', time.localtime(item.get('found_at', 0)))
+        when = fmt_datetime(item.get('found_at', 0))
         mark = "✅" if item.get('contacted') else "⬜"
         entries.append(
             f"{mark} {i}. <b>{name}</b> ({uname})\n"
@@ -2269,7 +2286,7 @@ async def run_parsing_job(
 
                     channel_link = f"https://t.me/{html.escape(r['channel'])}"
                     bio = html.escape(r['bio'][:150])
-                    found_when = time.strftime('%d.%m.%Y %H:%M', time.localtime(r.get('found_at', time.time())))
+                    found_when = fmt_datetime(r.get('found_at', time.time()))
 
                     report_entries.append(
                         f"{status_icon} <b>{i}. {name}</b> ({uname})\n"
@@ -2435,7 +2452,7 @@ async def grant_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     access_grants[str(target_id)] = {'until': until, 'granted_at': time.time()}
     await save_access_async(access_grants)
 
-    until_str = time.strftime('%d.%m.%Y', time.localtime(until))
+    until_str = fmt_date(until)
     await update.effective_message.reply_text(
         f"✅ Доступ выдан {display_name} (id={target_id}) на {days} дн. (до {until_str})."
     )
