@@ -20,6 +20,7 @@ from telethon.errors import (
 )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
+from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, ConversationHandler
@@ -2137,6 +2138,24 @@ async def disconnect_account(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ================== ЗАПУСК ==================
 
+async def call_with_retry(coro_factory, label: str, attempts: int = 6, delay: float = 5.0):
+    """Повторяет сетевой вызов к Telegram Bot API при обрыве соединения — на проде
+    бывают кратковременные обрывы TCP до серверов Telegram (тикет в поддержку
+    хостинга), и без ретрая единственный обрыв на старте убивает весь процесс.
+    coro_factory — функция без аргументов, возвращающая новую корутину на каждую
+    попытку (одну и ту же корутину повторно awaitить нельзя)."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await coro_factory()
+        except (TimedOut, NetworkError) as e:
+            last_exc = e
+            print(f"⚠️ {label}: попытка {attempt}/{attempts} не удалась ({type(e).__name__}: {e})")
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+    raise last_exc
+
+
 async def start_client(client: TelegramClient, name: str):
     await client.connect()
     if not await client.is_user_authorized():
@@ -2149,7 +2168,21 @@ async def start_client(client: TelegramClient, name: str):
 
 
 async def main():
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    # На проде бывают кратковременные обрывы TCP до Telegram (см. тикет в поддержку
+    # хостинга) — стандартный таймаут httpx (5с) на нестабильной сети срабатывает
+    # слишком рано. Даём больше запаса; на быстрой сети это ничего не меняет.
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .connect_timeout(20)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(20)
+        .get_updates_connect_timeout(20)
+        .get_updates_read_timeout(20)
+        .build()
+    )
 
     # Диалог: /start → (при необходимости) телефон → код → 2FA → меню
     # + парсинг
@@ -2219,7 +2252,7 @@ async def main():
 
     app.add_error_handler(error_handler)
 
-    await app.initialize()
+    await call_with_retry(app.initialize, "app.initialize()")
 
     # Mini App API (если модуль есть)
     try:
@@ -2244,25 +2277,31 @@ async def main():
     else:
         print("Общие Telethon-сессии не заданы (SESSION_NAMES пуст) — парсинг только через личные аккаунты пользователей.")
 
-    await app.bot.set_my_commands([
-        BotCommand("start", "Запустить бота / подключить аккаунт"),
-        BotCommand("parsing", "Новый парсинг"),
-        BotCommand("status", "Статус аккаунта"),
-        BotCommand("database", "Моя база каналов"),
-        BotCommand("tariffs", "Тарифы и доступ"),
-        BotCommand("support", "Поддержка"),
-        BotCommand("disconnect", "Отключить Telegram-аккаунт"),
-        BotCommand("cancel", "Отмена"),
-    ])
+    await call_with_retry(
+        lambda: app.bot.set_my_commands([
+            BotCommand("start", "Запустить бота / подключить аккаунт"),
+            BotCommand("parsing", "Новый парсинг"),
+            BotCommand("status", "Статус аккаунта"),
+            BotCommand("database", "Моя база каналов"),
+            BotCommand("tariffs", "Тарифы и доступ"),
+            BotCommand("support", "Поддержка"),
+            BotCommand("disconnect", "Отключить Telegram-аккаунт"),
+            BotCommand("cancel", "Отмена"),
+        ]),
+        "set_my_commands",
+    )
 
-    await app.bot.set_my_description(
-        "👋 Привет! Я ищу комментаторов Telegram-каналов и каналы, "
-        "которые они указали у себя в профиле.\n\nНажми Start, чтобы начать."
+    await call_with_retry(
+        lambda: app.bot.set_my_description(
+            "👋 Привет! Я ищу комментаторов Telegram-каналов и каналы, "
+            "которые они указали у себя в профиле.\n\nНажми Start, чтобы начать."
+        ),
+        "set_my_description",
     )
 
     print("Официальный бот запускается...")
-    await app.start()
-    await app.updater.start_polling()
+    await call_with_retry(app.start, "app.start()")
+    await call_with_retry(app.updater.start_polling, "updater.start_polling()")
     print("Бот успешно запущен!")
 
     await asyncio.Event().wait()
