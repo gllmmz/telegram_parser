@@ -390,6 +390,7 @@ async def is_user_account_connected(user_id: int) -> bool:
             except Exception:
                 pass
             _user_clients.pop(user_id, None)
+            _forget_client_tracking(client)
 
     if not has_session_file(user_id):
         return False
@@ -445,6 +446,7 @@ async def disconnect_user_client(user_id: int):
             await client.disconnect()
         except Exception:
             pass
+        _forget_client_tracking(client)
 
 
 async def create_login_client(user_id: int) -> TelegramClient:
@@ -532,6 +534,17 @@ def extract_channel_links(text: str) -> list[str]:
 client_subs_flood_until: dict[int, float] = {}
 client_broken_until: dict[int, float] = {}
 CLIENT_BROKEN_COOLDOWN = 45
+
+
+def _forget_client_tracking(client: TelegramClient):
+    """Чистит отметки 'сломан'/'в флуде' для клиента, который больше не будет
+    использоваться. Оба словаря выше ключуются id(client) (адрес объекта в памяти) —
+    CPython вправе переиспользовать этот адрес для нового объекта после сборки
+    мусора, и без явной чистки новый (рабочий) клиент может случайно унаследовать
+    статус давно уничтоженного. Актуально для личных аккаунтов пользователей —
+    они пересоздаются при переподключении, в отличие от общего пула сессий."""
+    client_broken_until.pop(id(client), None)
+    client_subs_flood_until.pop(id(client), None)
 
 
 async def get_channel_subscribers(username: str, client: TelegramClient) -> int | None:
