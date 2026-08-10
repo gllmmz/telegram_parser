@@ -63,7 +63,9 @@ def _validate_init_data(init_data: str) -> dict:
 
 async def get_current_user_id(x_telegram_init_data: str = Header(..., alias="X-Telegram-Init-Data")) -> int:
     user = _validate_init_data(x_telegram_init_data)
-    return int(user["id"])
+    uid = int(user["id"])
+    print(f"🔎 miniapp resolved user_id={uid} username={user.get('username')!r}")  # временный дебаг
+    return uid
 
 
 class ClearRequest(BaseModel):
