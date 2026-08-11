@@ -105,6 +105,7 @@ USER_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 CHANNELS, POSTS, SUBS_RANGE = range(3)
 CONNECT_PHONE, CONNECT_CODE, CONNECT_PASSWORD = range(3, 6)
 BROADCAST_SELECT, BROADCAST_TEXT, BROADCAST_CONFIRM = range(6, 9)
+REPARSE_SELECT = 9
 
 telethon_clients = [
     TelegramClient(name, API_ID, API_HASH, connection_retries=10, retry_delay=3)
@@ -1076,6 +1077,7 @@ def code_keyboard():
 def database_submenu_keyboard():
     keyboard = [
         [KeyboardButton("📡 Спарсенные каналы"), KeyboardButton("✨ Найденные каналы")],
+        [KeyboardButton("🔁 Парсинг по найденным")],
         [KeyboardButton("◀️ Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -1603,6 +1605,113 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=cancel_keyboard(),
     )
     return CHANNELS
+
+
+def unique_found_channels(user_id_str: str) -> list[dict]:
+    """Уникальные каналы (по channel) из базы найденных — один и тот же канал мог
+    встретиться у нескольких разных людей, для повторного парсинга нужен один раз.
+    Берём самое свежее вхождение (данные уже отсортированы по found_at по убыванию)."""
+    data = sorted(user_databases.get(user_id_str, []), key=lambda x: x.get('found_at', 0), reverse=True)
+    seen: dict[str, dict] = {}
+    for item in data:
+        ch = item['channel']
+        if ch not in seen:
+            seen[ch] = {'channel': ch, 'subscribers': item.get('subscribers', 0)}
+    return list(seen.values())
+
+
+def _reparse_select_prompt(channels: list[dict]) -> list[str]:
+    header = f"🔁 <b>Парсинг по найденным каналам</b> — выбери каналы ({len(channels)} шт.):\n\n"
+    entries = [
+        f"{i}. @{html.escape(item['channel'])} — {item['subscribers']:,} подп.\n"
+        for i, item in enumerate(channels, 1)
+    ]
+    return _chunk_parts([header] + entries)
+
+
+async def start_reparse_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if not await is_user_account_connected(user_id):
+        await update.message.reply_text("🔌 Сначала подключите аккаунт.\nНажми /start")
+        return ConversationHandler.END
+
+    if not await is_subscribed(user_id, context):
+        await update.message.reply_text(
+            "🔒 Чтобы пользоваться ботом, подпишись на канал:\n"
+            f"{REQUIRED_CHANNEL_LINK}\n\n"
+            "После подписки нажми «✅ Я подписался».",
+            reply_markup=subscribe_gate_keyboard(),
+        )
+        return ConversationHandler.END
+
+    if not has_access(user_id):
+        await update.message.reply_text(
+            "🔒 Бесплатные запросы закончились.\nПосмотри варианты — «💎 Тарифы» или /tariffs.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    channels = unique_found_channels(str(user_id))
+    if not channels:
+        await update.message.reply_text(
+            "✨ Здесь пока пусто — сначала запусти обычный парсинг, чтобы что-то найти.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    context.user_data['reparse_candidates'] = channels
+    for chunk in _reparse_select_prompt(channels):
+        await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+
+    await context.bot.send_message(
+        chat_id,
+        "Напиши номера через запятую и/или диапазоны (например: <code>1,3,5-9</code>) "
+        f"или слово «все» (максимум {MAX_CHANNELS_PER_PARSE} за раз).",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+    return REPARSE_SELECT
+
+
+async def connect_reparse_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "❌ Отмена":
+        context.user_data.pop('reparse_candidates', None)
+        await update.message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    candidates = context.user_data.get('reparse_candidates', [])
+    indices = _parse_selection(text, len(candidates))
+
+    if not indices:
+        await update.message.reply_text(
+            "Не понял выбор. Пришли номера через запятую и/или диапазоны "
+            "(например 1,3,5-9) или слово «все».",
+            reply_markup=cancel_keyboard(),
+        )
+        return REPARSE_SELECT
+
+    if len(indices) > MAX_CHANNELS_PER_PARSE:
+        await update.message.reply_text(
+            f"⚠️ Выбрано слишком много ({len(indices)}) — максимум {MAX_CHANNELS_PER_PARSE} за раз. "
+            "Сократи список и пришли ещё раз.",
+            reply_markup=cancel_keyboard(),
+        )
+        return REPARSE_SELECT
+
+    context.user_data['channels'] = [candidates[i - 1]['channel'] for i in indices]
+    context.user_data.pop('reparse_candidates', None)
+
+    await parsing_step_reply(
+        update, context,
+        f"Выбрано каналов: {len(indices)}.\n\n"
+        "Сколько последних постов смотреть? (число от 0 до 400)",
+        reply_markup=cancel_keyboard(),
+    )
+    return POSTS
 
 
 def _chunk_parts(parts: list[str], limit: int = 4000, sep: str = "") -> list[str]:
@@ -2589,6 +2698,7 @@ async def main():
             MessageHandler(filters.Regex("^🔍 Новый парсинг$"), new_parsing),
             CommandHandler("parsing", new_parsing),
             MessageHandler(filters.Regex("^📣 Рассылка$"), start_broadcast_select),
+            MessageHandler(filters.Regex("^🔁 Парсинг по найденным$"), start_reparse_select),
         ],
         states={
             CONNECT_PHONE: [
@@ -2607,6 +2717,7 @@ async def main():
             BROADCAST_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_selection)],
             BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_text)],
             BROADCAST_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_confirm)],
+            REPARSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_reparse_selection)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
