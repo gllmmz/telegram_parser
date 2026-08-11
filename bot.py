@@ -96,7 +96,14 @@ BROADCAST_DELAY_MIN = 4.0
 BROADCAST_DELAY_MAX = 9.0
 BROADCAST_EDIT_INTERVAL = 2.0
 
-# Папка с сессиями пользователей (каждый user_id → свой .session файл)
+# Сколько личных Telegram-аккаунтов может привязать один пользователь бота. Больше
+# аккаунтов — быстрее парсинг нескольких каналов за раз (каждый канал разбирает
+# свободный аккаунт, параллельно), но и больше нагрузка/риск на стороне Telegram —
+# 5 достаточно для заметного ускорения, не открывая совсем неограниченный пул.
+MAX_ACCOUNTS_PER_USER = 5
+
+# Папка с сессиями пользователей (первый аккаунт — {user_id}.session, второй и далее —
+# {user_id}_2.session, {user_id}_3.session и т.д., см. user_session_path())
 USER_SESSIONS_DIR = Path("user_sessions")
 USER_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 # ===============================================
@@ -106,6 +113,7 @@ CHANNELS, POSTS, SUBS_RANGE = range(3)
 CONNECT_PHONE, CONNECT_CODE, CONNECT_PASSWORD = range(3, 6)
 BROADCAST_SELECT, BROADCAST_TEXT, BROADCAST_CONFIRM = range(6, 9)
 REPARSE_SELECT = 9
+ACCOUNTS_DISCONNECT_SELECT = 10
 
 telethon_clients = [
     TelegramClient(name, API_ID, API_HASH, connection_retries=10, retry_delay=3)
@@ -153,8 +161,10 @@ user_cache_lock = asyncio.Lock()
 access_lock = asyncio.Lock()
 trial_lock = asyncio.Lock()
 
-# Живые клиенты пользователей: user_id -> TelegramClient (уже подключённые)
-_user_clients: dict[int, TelegramClient] = {}
+# Живые клиенты пользователей: (user_id, слот 1..MAX_ACCOUNTS_PER_USER) -> TelegramClient
+# (уже подключённые). Несколько аккаунтов на пользователя — чтобы при парсинге
+# нескольких каналов сразу их можно было разбирать параллельно разными аккаунтами.
+_user_clients: dict[tuple[int, int], TelegramClient] = {}
 _user_clients_lock = asyncio.Lock()
 
 
@@ -418,22 +428,40 @@ def access_status_text(user_id: int) -> str:
     return "Пробный период закончился. Для оформления подписки — /tariffs"
 
 
-# ================== СЕССИИ ПОЛЬЗОВАТЕЛЕЙ ==================
+# ================== СЕССИИ ПОЛЬЗОВАТЕЛЕЙ (несколько аккаунтов на юзера) ==================
 
-def user_session_path(user_id: int) -> str:
-    return str(USER_SESSIONS_DIR / str(user_id))
-
-
-def has_session_file(user_id: int) -> bool:
-    """Есть ли на диске файл сессии (ещё не значит, что она авторизована)."""
-    base = user_session_path(user_id)
-    return os.path.exists(base + ".session")
+def user_session_path(user_id: int, slot: int = 1) -> str:
+    """slot=1 — тот же путь, что был раньше у единственного аккаунта (обратная
+    совместимость: уже подключённые до многоаккаунтности пользователи не теряют
+    сессию). slot 2..MAX_ACCOUNTS_PER_USER — дополнительные аккаунты."""
+    suffix = "" if slot <= 1 else f"_{slot}"
+    return str(USER_SESSIONS_DIR / f"{user_id}{suffix}")
 
 
-async def is_user_account_connected(user_id: int) -> bool:
-    """Проверяет, что у пользователя есть валидная авторизованная Telethon-сессия."""
+def has_session_file(user_id: int, slot: int = 1) -> bool:
+    """Есть ли на диске файл сессии для слота (ещё не значит, что она авторизована)."""
+    return os.path.exists(user_session_path(user_id, slot) + ".session")
+
+
+def user_used_slots(user_id: int) -> list[int]:
+    """Слоты (1..MAX_ACCOUNTS_PER_USER), под которыми на диске есть файл сессии."""
+    return [s for s in range(1, MAX_ACCOUNTS_PER_USER + 1) if has_session_file(user_id, s)]
+
+
+def next_free_slot(user_id: int) -> int | None:
+    """Первый свободный слот для нового аккаунта, None — если лимит исчерпан."""
+    used = set(user_used_slots(user_id))
+    for s in range(1, MAX_ACCOUNTS_PER_USER + 1):
+        if s not in used:
+            return s
+    return None
+
+
+async def is_slot_connected(user_id: int, slot: int) -> bool:
+    """Проверяет, что конкретный слот пользователя — валидная авторизованная сессия."""
+    key = (user_id, slot)
     async with _user_clients_lock:
-        client = _user_clients.get(user_id)
+        client = _user_clients.get(key)
         if client is not None:
             try:
                 if not client.is_connected():
@@ -441,20 +469,20 @@ async def is_user_account_connected(user_id: int) -> bool:
                 if await client.is_user_authorized():
                     return True
             except Exception as e:
-                print(f"⚠️ is_user_account_connected({user_id}) live client: {e}")
+                print(f"⚠️ is_slot_connected({user_id}, {slot}) live client: {e}")
             # Сессия битая — убираем из кэша
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            _user_clients.pop(user_id, None)
+            _user_clients.pop(key, None)
             _forget_client_tracking(client)
 
-    if not has_session_file(user_id):
+    if not has_session_file(user_id, slot):
         return False
 
     client = TelegramClient(
-        user_session_path(user_id), API_ID, API_HASH,
+        user_session_path(user_id, slot), API_ID, API_HASH,
         connection_retries=5, retry_delay=2,
     )
     try:
@@ -462,14 +490,14 @@ async def is_user_account_connected(user_id: int) -> bool:
         ok = await client.is_user_authorized()
         if ok:
             async with _user_clients_lock:
-                _user_clients[user_id] = client
+                _user_clients[key] = client
             return True
         await client.disconnect()
         # Файл есть, но не авторизован — удаляем мусор
-        _remove_session_files(user_id)
+        _remove_session_files(user_id, slot)
         return False
     except Exception as e:
-        print(f"⚠️ is_user_account_connected({user_id}): {e}")
+        print(f"⚠️ is_slot_connected({user_id}, {slot}): {e}")
         try:
             await client.disconnect()
         except Exception:
@@ -477,8 +505,17 @@ async def is_user_account_connected(user_id: int) -> bool:
         return False
 
 
-def _remove_session_files(user_id: int):
-    base = user_session_path(user_id)
+async def is_user_account_connected(user_id: int) -> bool:
+    """Есть ли у пользователя хотя бы один подключённый аккаунт (для общих гейтов —
+    доступа к парсингу, рассылке и т.п., которым не важно, сколько именно)."""
+    for slot in range(1, MAX_ACCOUNTS_PER_USER + 1):
+        if await is_slot_connected(user_id, slot):
+            return True
+    return False
+
+
+def _remove_session_files(user_id: int, slot: int = 1):
+    base = user_session_path(user_id, slot)
     for suffix in (".session", ".session-journal"):
         path = base + suffix
         try:
@@ -488,31 +525,48 @@ def _remove_session_files(user_id: int):
             print(f"⚠️ не удалось удалить {path}: {e}")
 
 
+async def get_user_clients(user_id: int) -> list[TelegramClient]:
+    """Все подключённые авторизованные клиенты пользователя (по всем занятым слотам,
+    по возрастанию) — чтобы разбирать несколько каналов параллельно."""
+    clients = []
+    for slot in range(1, MAX_ACCOUNTS_PER_USER + 1):
+        if await is_slot_connected(user_id, slot):
+            async with _user_clients_lock:
+                client = _user_clients.get((user_id, slot))
+            if client is not None:
+                clients.append(client)
+    return clients
+
+
 async def get_user_client(user_id: int) -> TelegramClient | None:
-    """Возвращает подключённый авторизованный клиент пользователя или None."""
-    if not await is_user_account_connected(user_id):
-        return None
-    async with _user_clients_lock:
-        return _user_clients.get(user_id)
+    """Один (первый доступный) клиент пользователя — для операций, которым нужен
+    только один аккаунт (рассылка, проверка статуса и т.п.)."""
+    clients = await get_user_clients(user_id)
+    return clients[0] if clients else None
 
 
-async def disconnect_user_client(user_id: int):
-    async with _user_clients_lock:
-        client = _user_clients.pop(user_id, None)
-    if client is not None:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        _forget_client_tracking(client)
+async def disconnect_user_client(user_id: int, slot: int | None = None):
+    """slot=None — отключает все аккаунты пользователя, иначе — только указанный."""
+    slots = [slot] if slot is not None else list(range(1, MAX_ACCOUNTS_PER_USER + 1))
+    for s in slots:
+        key = (user_id, s)
+        async with _user_clients_lock:
+            client = _user_clients.pop(key, None)
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            _forget_client_tracking(client)
 
 
-async def create_login_client(user_id: int) -> TelegramClient:
-    """Создаёт (или пересоздаёт) клиент для процесса входа. Старую сессию сбрасываем."""
-    await disconnect_user_client(user_id)
-    _remove_session_files(user_id)
+async def create_login_client(user_id: int, slot: int) -> TelegramClient:
+    """Создаёт (или пересоздаёт) клиент для процесса входа в указанный слот.
+    Старую сессию этого слота сбрасываем."""
+    await disconnect_user_client(user_id, slot)
+    _remove_session_files(user_id, slot)
     client = TelegramClient(
-        user_session_path(user_id), API_ID, API_HASH,
+        user_session_path(user_id, slot), API_ID, API_HASH,
         connection_retries=5, retry_delay=2,
     )
     await client.connect()
@@ -1079,6 +1133,7 @@ async def parse_channel(
 def main_menu_keyboard():
     keyboard = [
         [KeyboardButton("🔍 Новый парсинг")],
+        [KeyboardButton("🔗 Привязанные аккаунты")],
         [KeyboardButton("📁 Моя база каналов"), KeyboardButton("👤 Аккаунт")],
         [KeyboardButton("💎 Тарифы"), KeyboardButton("🛠 Поддержка")]
     ]
@@ -1097,6 +1152,16 @@ def connect_phone_keyboard():
         ],
         resize_keyboard=True,
     )
+
+
+def linked_accounts_keyboard(can_add: bool, has_any: bool):
+    rows = []
+    if can_add:
+        rows.append([KeyboardButton("➕ Добавить аккаунт")])
+    if has_any:
+        rows.append([KeyboardButton("🗑 Отключить аккаунт")])
+    rows.append([KeyboardButton("◀️ Назад")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def code_keyboard():
@@ -1231,6 +1296,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2) Подключение аккаунта (ДО проверки подписки)
     if not await is_user_account_connected(user_id):
+        context.user_data['login_slot'] = next_free_slot(user_id) or 1
         await context.bot.send_message(
             chat_id,
             "🔌 <b>Для работы подключите аккаунт</b>\n\n"
@@ -1307,9 +1373,10 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     status = await context.bot.send_message(chat_id, "⏳ Отправляю код…")
+    slot = context.user_data.get('login_slot', 1)
 
     try:
-        client = await create_login_client(user_id)
+        client = await create_login_client(user_id, slot)
         sent = await client.send_code_request(phone)
         # Длина кода у Telegram не всегда 5 — зависит от способа доставки, сервер
         # присылает её в sent.type.length. Если атрибута нет (редкие типы вроде
@@ -1551,6 +1618,7 @@ async def _update_code_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
 async def _cleanup_login(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     client = context.user_data.pop('login_client', None)
+    slot = context.user_data.get('login_slot', 1)
     if client is not None:
         try:
             await client.disconnect()
@@ -1561,17 +1629,19 @@ async def _cleanup_login(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     context.user_data.pop('code_digits', None)
     context.user_data.pop('code_msg_id', None)
     context.user_data.pop('code_length', None)
-    # Неавторизованную сессию удаляем
-    if not await is_user_account_connected(user_id):
-        _remove_session_files(user_id)
+    context.user_data.pop('login_slot', None)
+    # Неавторизованную сессию этого слота удаляем
+    if not await is_slot_connected(user_id, slot):
+        _remove_session_files(user_id, slot)
 
 
 async def _finish_login(update: Update, context: ContextTypes.DEFAULT_TYPE, client: TelegramClient, user_id: int):
     chat_id = update.effective_chat.id
+    slot = context.user_data.get('login_slot', 1)
 
     # Сохраняем клиент в кэш
     async with _user_clients_lock:
-        _user_clients[user_id] = client
+        _user_clients[(user_id, slot)] = client
 
     me = await client.get_me()
     name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "аккаунт"
@@ -1590,10 +1660,11 @@ async def _finish_login(update: Update, context: ContextTypes.DEFAULT_TYPE, clie
     context.user_data.pop('code_digits', None)
     context.user_data.pop('code_length', None)
     context.user_data.pop('login_client', None)
+    context.user_data.pop('login_slot', None)
 
     await context.bot.send_message(
         chat_id,
-        f"✅ Аккаунт подключён: <b>{html.escape(name)}</b> ({html.escape(uname)})",
+        f"✅ Аккаунт №{slot} подключён: <b>{html.escape(name)}</b> ({html.escape(uname)})",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -1608,7 +1679,7 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_user_account_connected(user_id):
         await parsing_step_reply(
             update, context,
-            "🔌 Сначала подключите аккаунт.\nНажми /start",
+            "🔌 Сначала подключите аккаунт — «🔗 Привязанные аккаунты» в меню.",
             reply_markup=main_menu_keyboard(),
         )
         return ConversationHandler.END
@@ -1672,7 +1743,7 @@ async def start_reparse_select(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
 
     if not await is_user_account_connected(user_id):
-        await update.message.reply_text("🔌 Сначала подключите аккаунт.\nНажми /start")
+        await update.message.reply_text("🔌 Сначала подключите аккаунт — «🔗 Привязанные аккаунты» в меню.")
         return ConversationHandler.END
 
     if not await is_subscribed(user_id, context):
@@ -1926,6 +1997,16 @@ async def database_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=database_submenu_keyboard()
         )
+    elif screen == 'accounts':
+        # "◀️ Назад" с экрана "Привязанные аккаунты" — не относится к базе каналов,
+        # просто в главное меню (тот же db_screen-флаг переиспользован для простоты,
+        # чтобы не заводить отдельный параллельный механизм навигации).
+        context.user_data.pop('db_screen', None)
+        await replace_last_message(
+            update, context, 'accounts_msg_id',
+            "Главное меню:",
+            reply_markup=main_menu_keyboard()
+        )
     else:
         which = context.user_data.get('db_current_list', 'found')
         await show_database_list(update, context, which)
@@ -1983,7 +2064,7 @@ async def start_broadcast_select(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     if not await is_user_account_connected(user_id):
-        await update.message.reply_text("🔌 Сначала подключите личный аккаунт.\nНажми /start")
+        await update.message.reply_text("🔌 Сначала подключите личный аккаунт — «🔗 Привязанные аккаунты» в меню.")
         return ConversationHandler.END
 
     candidates = broadcast_candidates(str(user_id))
@@ -2121,18 +2202,19 @@ async def connect_broadcast_confirm(update: Update, context: ContextTypes.DEFAUL
 
 async def account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    connected = await is_user_account_connected(user.id)
-    if connected:
-        client = await get_user_client(user.id)
-        try:
-            me = await client.get_me()
-            acc_line = f"Подключён: {me.first_name or ''} {me.last_name or ''}".strip()
-            if me.username:
-                acc_line += f" (@{me.username})"
-        except Exception:
-            acc_line = "Подключён (сессия активна)"
+    slots = user_used_slots(user.id)
+    connected_count = 0
+    for slot in slots:
+        if await is_slot_connected(user.id, slot):
+            connected_count += 1
+
+    if connected_count:
+        acc_line = (
+            f"Подключено аккаунтов: {connected_count} из {MAX_ACCOUNTS_PER_USER} "
+            f"— «🔗 Привязанные аккаунты»"
+        )
     else:
-        acc_line = "Не подключён — нажми /start"
+        acc_line = "Не подключено — «🔗 Привязанные аккаунты» в меню"
 
     await replace_last_message(
         update, context, 'account_msg_id',
@@ -2145,6 +2227,109 @@ async def account(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
+
+
+# ================== ПРИВЯЗАННЫЕ АККАУНТЫ (несколько на пользователя) ==================
+
+async def show_linked_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    context.user_data['db_screen'] = 'accounts'
+    slots = user_used_slots(user_id)
+
+    lines = [f"🔗 <b>Привязанные аккаунты</b> ({len(slots)} из {MAX_ACCOUNTS_PER_USER}):\n"]
+    if not slots:
+        lines.append("Пока ничего не подключено.\n")
+    for slot in slots:
+        if await is_slot_connected(user_id, slot):
+            async with _user_clients_lock:
+                client = _user_clients.get((user_id, slot))
+            try:
+                me = await client.get_me()
+                name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "аккаунт"
+                uname = f"@{me.username}" if me.username else f"id{me.id}"
+                lines.append(f"{slot}. ✅ {html.escape(name)} ({html.escape(uname)})\n")
+            except Exception:
+                lines.append(f"{slot}. ✅ аккаунт №{slot} (подключён)\n")
+        else:
+            lines.append(f"{slot}. ⚠️ сессия не работает\n")
+
+    lines.append(
+        "\nБольше аккаунтов — быстрее парсинг: если каналов в запросе несколько, "
+        "они разбираются параллельно, каждый своим аккаунтом."
+    )
+
+    can_add = len(slots) < MAX_ACCOUNTS_PER_USER
+    await replace_last_message(
+        update, context, 'accounts_msg_id',
+        "".join(lines),
+        parse_mode="HTML",
+        reply_markup=linked_accounts_keyboard(can_add, bool(slots)),
+    )
+
+
+async def start_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    slot = next_free_slot(user_id)
+    if slot is None:
+        await update.message.reply_text(
+            f"Достигнут лимит — можно подключить не больше {MAX_ACCOUNTS_PER_USER} аккаунтов. "
+            "Сначала отключи какой-нибудь через «🗑 Отключить аккаунт».",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    context.user_data['login_slot'] = slot
+    await update.message.reply_text(
+        f"🔌 <b>Подключение аккаунта №{slot}</b>\n\n"
+        "Отправьте номер телефона в международном формате "
+        "(например <code>+79001234567</code>) или нажмите кнопку ниже.",
+        parse_mode="HTML",
+        reply_markup=connect_phone_keyboard(),
+    )
+    return CONNECT_PHONE
+
+
+async def start_disconnect_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    slots = user_used_slots(user_id)
+    if not slots:
+        await update.message.reply_text("Нет подключённых аккаунтов.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    context.user_data['disconnect_slots'] = slots
+    listing = "\n".join(f"{s}. аккаунт №{s}" for s in slots)
+    await update.message.reply_text(
+        f"Какой аккаунт отключить? Напиши номер:\n\n{listing}",
+        reply_markup=cancel_keyboard(),
+    )
+    return ACCOUNTS_DISCONNECT_SELECT
+
+
+async def connect_disconnect_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+
+    if text == "❌ Отмена":
+        context.user_data.pop('disconnect_slots', None)
+        await update.message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    slots = context.user_data.get('disconnect_slots', [])
+    if not text.isdigit() or int(text) not in slots:
+        await update.message.reply_text(
+            "Не понял номер. Напиши один из предложенных или ❌ Отмена.",
+            reply_markup=cancel_keyboard(),
+        )
+        return ACCOUNTS_DISCONNECT_SELECT
+
+    slot = int(text)
+    await disconnect_user_client(user_id, slot)
+    _remove_session_files(user_id, slot)
+    context.user_data.pop('disconnect_slots', None)
+    await update.message.reply_text(
+        f"🔌 Аккаунт №{slot} отключён.", reply_markup=main_menu_keyboard()
+    )
+    return ConversationHandler.END
 
 
 def _money(n: int) -> str:
@@ -2290,12 +2475,13 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Личный аккаунт обязателен
-    client = await get_user_client(user_id)
-    if client is None:
+    # Хотя бы один личный аккаунт обязателен
+    clients = await get_user_clients(user_id)
+    if not clients:
         await context.bot.send_message(
             chat_id,
-            "🔌 Аккаунт не подключён или сессия истекла. Нажми /start",
+            "🔌 Аккаунт не подключён или сессия истекла. "
+            "Зайди в «🔗 Привязанные аккаунты» и подключи хотя бы один.",
             reply_markup=main_menu_keyboard(),
         )
         return ConversationHandler.END
@@ -2315,7 +2501,7 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with parse_semaphore:
         await run_parsing_job(
             context, chat_id, user_id, channels, posts, min_subs, max_subs, trial_note,
-            client=client,
+            clients=clients,
         )
 
     return ConversationHandler.END
@@ -2325,23 +2511,24 @@ async def run_parsing_job(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
     channels: list[str], posts: int, min_subs: int, max_subs: int,
     trial_note: str | None = None,
-    *, client: TelegramClient | None = None,
+    *, clients: list[TelegramClient] | None = None,
     notify_chat: bool = True, on_progress: "callable | None" = None,
 ):
     global active_parses
 
-    if client is None:
-        client = await get_user_client(user_id)
-    if client is None:
+    if clients is None:
+        clients = await get_user_clients(user_id)
+    if not clients:
         if notify_chat:
             await context.bot.send_message(
                 chat_id,
-                "🔌 Аккаунт не подключён. Нажми /start",
+                "🔌 Аккаунт не подключён. Зайди в «🔗 Привязанные аккаунты» и подключи хотя бы один.",
                 reply_markup=main_menu_keyboard(),
             )
         return {'results': [], 'rejected': []}
 
-    await ensure_connected(client, "личный")
+    for c in clients:
+        await ensure_connected(c, "личный")
     active_parses += 1
     try:
         await record_parsed_channels(user_id, channels)
@@ -2350,10 +2537,11 @@ async def run_parsing_job(
             await context.bot.send_message(chat_id, "⏳ Запускаю парсинг...", reply_markup=ReplyKeyboardRemove())
 
             trial_line = f"\n{trial_note}" if trial_note else ""
+            accounts_line = f" · аккаунтов: {len(clients)}" if len(clients) > 1 else ""
             status_msg = await context.bot.send_message(
                 chat_id,
                 f"⚡️ <b>Запускаю парсинг</b>{trial_line}\n\n"
-                f"📡 Каналов: <b>{len(channels)}</b>\n"
+                f"📡 Каналов: <b>{len(channels)}</b>{accounts_line}\n"
                 f"📄 Постов: <b>{posts}</b>\n"
                 f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n\n"
                 "Это может занять несколько минут…",
@@ -2362,12 +2550,12 @@ async def run_parsing_job(
 
         all_results = []
         all_filtered_out = []
-        debug_info = []
+        debug_info: list[str | None] = [None] * len(channels)
 
         seen_users = set()
         tracker = ProgressTracker(
             status_msg, total_posts=posts * len(channels), channels_total=len(channels),
-            account_label="личный",
+            account_label="личный" if len(clients) == 1 else f"{len(clients)} акк.",
             on_update=on_progress,
         )
 
@@ -2390,25 +2578,39 @@ async def run_parsing_job(
             if added:
                 await save_databases_async(user_databases)
 
+        channel_queue: asyncio.Queue = asyncio.Queue()
         for idx, ch in enumerate(channels, 1):
-            channel_timeout = max(300, posts * 30)
-            try:
-                results, filtered_out, info = await asyncio.wait_for(
-                    parse_channel(
-                        ch, posts, min_subs, max_subs,
-                        client=client, seen_users=seen_users, tracker=tracker,
-                        channel_idx=idx, channels_total=len(channels),
-                        on_new_results=on_new_results,
-                    ),
-                    timeout=channel_timeout,
-                )
-            except asyncio.TimeoutError:
-                print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
-                results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
-            await tracker.channel_done()
-            all_results.extend(results)
-            all_filtered_out.extend(filtered_out)
-            debug_info.append(f"@{ch}: {info}")
+            channel_queue.put_nowait((idx, ch))
+
+        async def channel_worker(worker_client: TelegramClient):
+            while True:
+                try:
+                    idx, ch = channel_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                channel_timeout = max(300, posts * 30)
+                try:
+                    results, filtered_out, info = await asyncio.wait_for(
+                        parse_channel(
+                            ch, posts, min_subs, max_subs,
+                            client=worker_client, seen_users=seen_users, tracker=tracker,
+                            channel_idx=idx, channels_total=len(channels),
+                            on_new_results=on_new_results,
+                        ),
+                        timeout=channel_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
+                    results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
+                await tracker.channel_done()
+                all_results.extend(results)
+                all_filtered_out.extend(filtered_out)
+                debug_info[idx - 1] = f"@{ch}: {info}"
+
+        # Один воркер на каждый доступный аккаунт — каналы разбираются из общей
+        # очереди, так что при нескольких аккаунтах несколько каналов обрабатываются
+        # параллельно (каждый своим аккаунтом), а не строго один за другим.
+        await asyncio.gather(*(channel_worker(c) for c in clients))
 
         await save_channel_cache_async(channel_subs_cache)
         await save_user_cache_async(user_info_cache)
@@ -2434,7 +2636,7 @@ async def run_parsing_job(
 
         if notify_chat:
             debug_header = "📊 <b>Статистика:</b>\n"
-            debug_entries = [html.escape(line) + "\n" for line in debug_info]
+            debug_entries = [html.escape(line) + "\n" for line in debug_info if line]
             for chunk in _chunk_parts([debug_header] + debug_entries, sep=""):
                 await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
 
@@ -2660,12 +2862,15 @@ async def revoke_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def disconnect_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Пользователь может отключить свой аккаунт командой /disconnect."""
+    """/disconnect отключает СРАЗУ ВСЕ привязанные аккаунты пользователя. Точечно —
+    один конкретный — через «🔗 Привязанные аккаунты» в меню."""
     user_id = update.effective_user.id
-    await disconnect_user_client(user_id)
-    _remove_session_files(user_id)
+    slots = user_used_slots(user_id)
+    await disconnect_user_client(user_id)  # без slot — отключает все
+    for slot in slots:
+        _remove_session_files(user_id, slot)
     await update.effective_message.reply_text(
-        "🔌 Аккаунт отключён. Чтобы подключить снова — /start",
+        "🔌 Все аккаунты отключены. Чтобы подключить снова — /start или «🔗 Привязанные аккаунты».",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -2728,6 +2933,8 @@ async def main():
             CommandHandler("parsing", new_parsing),
             MessageHandler(filters.Regex("^📣 Рассылка$"), start_broadcast_select),
             MessageHandler(filters.Regex("^🔁 Парсинг по найденным$"), start_reparse_select),
+            MessageHandler(filters.Regex("^➕ Добавить аккаунт$"), start_add_account),
+            MessageHandler(filters.Regex("^🗑 Отключить аккаунт$"), start_disconnect_select),
         ],
         states={
             CONNECT_PHONE: [
@@ -2747,6 +2954,9 @@ async def main():
             BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_text)],
             BROADCAST_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_confirm)],
             REPARSE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_reparse_selection)],
+            ACCOUNTS_DISCONNECT_SELECT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, connect_disconnect_selection)
+            ],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
@@ -2766,6 +2976,7 @@ async def main():
     app.add_handler(CommandHandler("disconnect", disconnect_account))
     app.add_handler(MessageHandler(filters.Regex("^📁 Моя база каналов$"), my_database))
     app.add_handler(MessageHandler(filters.Regex("^👤 Аккаунт$"), account))
+    app.add_handler(MessageHandler(filters.Regex("^🔗 Привязанные аккаунты$"), show_linked_accounts))
     app.add_handler(MessageHandler(filters.Regex("^💎 Тарифы$"), tariffs))
     app.add_handler(MessageHandler(filters.Regex("^🛠 Поддержка$"), support))
 
