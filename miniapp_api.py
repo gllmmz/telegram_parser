@@ -116,7 +116,8 @@ def create_app(bot) -> FastAPI:
             "user_id": user_id,
             "is_admin": botmod.is_admin(user_id),
             "has_paid_access": botmod.has_paid_access(user_id),
-            "free_trials_left": botmod.free_trials_left(user_id),
+            "trial_active": botmod.trial_active(user_id),
+            "trial_seconds_left": botmod.trial_seconds_left(user_id),
             "has_access": botmod.has_access(user_id),
             "status_text": botmod.access_status_text(user_id),
         }
@@ -189,14 +190,14 @@ def create_app(bot) -> FastAPI:
                 f"Чтобы пользоваться ботом, подпишись на канал {botmod.REQUIRED_CHANNEL_LINK}",
             )
 
-        # Проверка лимита бесплатных попыток и его списание должны быть атомарны относительно
-        # друг друга — иначе несколько параллельных запросов от одного пользователя все пройдут
-        # проверку has_access() до того, как первый из них спишет попытку.
+        # Проверка пробного периода и его старт должны быть атомарны относительно друг
+        # друга — иначе несколько параллельных запросов от одного пользователя все
+        # пройдут проверку has_access() до того, как первый из них его начнёт.
         async with _lock_for_user(user_id):
             if not botmod.has_access(user_id):
-                raise HTTPException(403, "Бесплатные запросы закончились. Оформи подписку.")
+                raise HTTPException(403, "Пробный период закончился. Оформи подписку.")
             if not botmod.has_paid_access(user_id):
-                await botmod.consume_trial_use(user_id)
+                await botmod.ensure_trial_started(user_id)
 
             _cleanup_old_jobs()
             job_id = uuid.uuid4().hex

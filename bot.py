@@ -60,7 +60,7 @@ DATABASE_FILE = "user_databases.json"
 PARSED_CHANNELS_FILE = "parsed_channels_history.json"
 ACCESS_FILE = "access_grants.json"
 TRIAL_FILE = "trial_usage.json"
-FREE_TRIAL_LIMIT = 3  # столько парсингов новый пользователь может сделать бесплатно, без подписки
+FREE_TRIAL_DAYS = 1  # столько дней с первого парсинга бот бесплатно доступен без подписки, без счётчика попыток
 
 # Тарифы подписки: (месяцев, цена в рублях, скидка %, выгода в рублях относительно помесячной цены).
 TARIFFS = [
@@ -343,20 +343,57 @@ def has_paid_access(user_id: int) -> bool:
     return grant is not None and time.time() < grant['until']
 
 
-def free_trials_left(user_id: int) -> int:
-    used = trial_usage.get(str(user_id), 0)
-    return max(0, FREE_TRIAL_LIMIT - used)
+def _trial_started_at(user_id: int) -> float | None:
+    """Момент начала пробного периода (первый парсинг), если уже начат."""
+    entry = trial_usage.get(str(user_id))
+    if isinstance(entry, dict):
+        return entry.get('started_at')
+    # Старый формат (int — счётчик использований) от версии с лимитом на 3 попытки:
+    # мы не знаем, когда реально был первый парсинг, поэтому не считаем это началом
+    # пробного периода — пользователь просто получит полный день заново.
+    return None
 
 
-async def consume_trial_use(user_id: int) -> int:
+async def ensure_trial_started(user_id: int) -> float:
+    """Отмечает начало пробного периода при первом парсинге. Идемпотентно — повторные
+    вызовы для уже начатого периода ничего не меняют. Возвращает момент начала."""
     key = str(user_id)
-    trial_usage[key] = trial_usage.get(key, 0) + 1
+    started_at = _trial_started_at(user_id)
+    if started_at is not None:
+        return started_at
+    started_at = time.time()
+    trial_usage[key] = {'started_at': started_at}
     await save_trial_usage_async(trial_usage)
-    return trial_usage[key]
+    return started_at
+
+
+def trial_active(user_id: int) -> bool:
+    """Пробный период считается активным, пока не начат (даётся при первом парсинге)
+    или пока не истёк FREE_TRIAL_DAYS с момента начала."""
+    started_at = _trial_started_at(user_id)
+    if started_at is None:
+        return True
+    return time.time() - started_at < FREE_TRIAL_DAYS * 86400
+
+
+def trial_seconds_left(user_id: int) -> float:
+    started_at = _trial_started_at(user_id)
+    if started_at is None:
+        return FREE_TRIAL_DAYS * 86400
+    return max(0.0, FREE_TRIAL_DAYS * 86400 - (time.time() - started_at))
 
 
 def has_access(user_id: int) -> bool:
-    return has_paid_access(user_id) or free_trials_left(user_id) > 0
+    return has_paid_access(user_id) or trial_active(user_id)
+
+
+def _format_hm(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    if hours >= 1:
+        return f"~{hours} ч."
+    minutes = max(1, seconds // 60)
+    return f"~{minutes} мин."
 
 
 def access_status_text(user_id: int) -> str:
@@ -369,15 +406,16 @@ def access_status_text(user_id: int) -> str:
         days = int((grant['until'] - time.time()) // 86400) + 1
         return f"Активна до {until_str} (осталось ~{days} дн.)"
 
-    trials_left = free_trials_left(user_id)
-    if trials_left > 0:
-        return f"Бесплатных запросов осталось: {trials_left} из {FREE_TRIAL_LIMIT}"
+    if trial_active(user_id):
+        if _trial_started_at(user_id) is None:
+            return f"Бесплатный пробный период на {FREE_TRIAL_DAYS} дн. — начнётся с первого парсинга"
+        return f"Бесплатный пробный период — осталось {_format_hm(trial_seconds_left(user_id))}"
 
     if grant is not None:
         until_str = fmt_date(grant['until'])
         return f"Подписка истекла {until_str}. Для продления — /tariffs"
 
-    return "Бесплатные запросы закончились. Для оформления подписки — /tariffs"
+    return "Пробный период закончился. Для оформления подписки — /tariffs"
 
 
 # ================== СЕССИИ ПОЛЬЗОВАТЕЛЕЙ ==================
@@ -1588,7 +1626,7 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_access(user_id):
         await parsing_step_reply(
             update, context,
-            "🔒 <b>Бесплатные запросы закончились.</b>\n\n"
+            "🔒 <b>Пробный период закончился.</b>\n\n"
             "Посмотри варианты и оформи доступ — «💎 Тарифы» или /tariffs.",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard(),
@@ -1648,7 +1686,7 @@ async def start_reparse_select(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not has_access(user_id):
         await update.message.reply_text(
-            "🔒 Бесплатные запросы закончились.\nПосмотри варианты — «💎 Тарифы» или /tariffs.",
+            "🔒 Пробный период закончился.\nПосмотри варианты — «💎 Тарифы» или /tariffs.",
             reply_markup=main_menu_keyboard(),
         )
         return ConversationHandler.END
@@ -2271,8 +2309,8 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     trial_note = None
     if not has_paid_access(user_id):
-        used_count = await consume_trial_use(user_id)
-        trial_note = f"🎁 Бесплатный запрос {used_count} из {FREE_TRIAL_LIMIT}"
+        await ensure_trial_started(user_id)
+        trial_note = f"🎁 Пробный период — осталось {_format_hm(trial_seconds_left(user_id))}"
 
     async with parse_semaphore:
         await run_parsing_job(
@@ -2448,17 +2486,8 @@ async def run_parsing_job(
                     reply_markup=main_menu_keyboard()
                 )
 
-            if rejected_list:
-                rejected_header = f"📛 <b>Не подошли по подписчикам ({len(rejected_list)}):</b>\n"
-                rejected_entries = []
-                for item in rejected_list:
-                    mention = f"упомянут у {item['count']} чел." if item['count'] > 1 else "упомянут у 1 чел."
-                    rejected_entries.append(
-                        f"@{html.escape(item['channel'])} — <b>{item['subscribers']:,}</b> подп. ({mention})"
-                    )
-
-                for chunk in _chunk_parts([rejected_header] + rejected_entries, sep="\n"):
-                    await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+            # Каналы, не прошедшие фильтр по подписчикам, пользователю не показываем —
+            # это шум, не относящийся к результату парсинга по заданным критериям.
 
         return {'results': unique, 'rejected': rejected_list}
     finally:

@@ -113,15 +113,6 @@
       });
   });
 
-  function renderRejectedItem(it) {
-    var channelLink = '<span class="link tg-link" data-url="https://t.me/' + esc(it.channel) + '">@' + esc(it.channel) + '</span>';
-    var mention = it.count > 1 ? "упомянут у " + it.count + " чел." : "упомянут у 1 чел.";
-    return '<div class="list-item">' +
-      '<div class="title">' + channelLink + '</div>' +
-      '<div class="meta">' + esc(it.subscribers) + ' подп. — ' + mention + '</div>' +
-      '</div>';
-  }
-
   // ---------- Навигация ----------
   var screens = ["dashboard", "parsing", "reparse", "database", "account", "broadcast"];
   var titles = {
@@ -165,8 +156,6 @@
     document.getElementById("parsing-done").style.display = "none";
     document.getElementById("parsing-error").textContent = "";
     document.getElementById("pd-results").innerHTML = "";
-    document.getElementById("pd-rejected").innerHTML = "";
-    document.getElementById("pd-rejected-wrap").style.display = "none";
   }
 
   function startJobAndShowProgress(channels, posts, minSubs, maxSubs, errEl, submitBtn) {
@@ -233,12 +222,6 @@
             var results = job.results || [];
             document.getElementById("pd-results").innerHTML = results.length
               ? results.map(renderFoundItem).join("")
-              : "";
-
-            var rejected = job.rejected || [];
-            document.getElementById("pd-rejected-wrap").style.display = rejected.length ? "block" : "none";
-            document.getElementById("pd-rejected").innerHTML = rejected.length
-              ? rejected.map(renderRejectedItem).join("")
               : "";
           }
         }
