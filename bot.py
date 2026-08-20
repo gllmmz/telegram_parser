@@ -12,15 +12,19 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telethon import TelegramClient
-from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.functions.messages import GetRepliesRequest
-from telethon.tl.types import Channel, User
+from telethon.tl.functions.messages import GetRepliesRequest, SearchGlobalRequest
+from telethon.tl.functions.payments import GetSavedStarGiftsRequest
+from telethon.tl.types import (
+    Channel, User, InputMessagesFilterEmpty, InputPeerEmpty,
+    ChannelParticipantsAdmins, ChannelParticipantCreator,
+)
 from telethon.errors import (
     FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError,
     MsgIdInvalidError, PhoneNumberInvalidError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError,
-    PeerFloodError,
+    PeerFloodError, ChatAdminRequiredError,
 )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
@@ -114,6 +118,22 @@ CONNECT_PHONE, CONNECT_CODE, CONNECT_PASSWORD = range(3, 6)
 BROADCAST_SELECT, BROADCAST_TEXT, BROADCAST_CONFIRM = range(6, 9)
 REPARSE_SELECT = 9
 ACCOUNTS_DISCONNECT_SELECT = 10
+METHOD_SELECT, PARSE_ACCOUNT_SELECT, KEYWORD_INPUT = range(11, 14)
+
+# ---- Способы поиска ----
+SEARCH_METHOD_COMMENTS = 'comments'
+SEARCH_METHOD_GIFTS = 'gifts'
+SEARCH_METHOD_KEYWORD = 'keyword'
+
+SEARCH_METHOD_BUTTONS = {
+    "💬 Через комментарии": SEARCH_METHOD_COMMENTS,
+    "🎁 Через подарки": SEARCH_METHOD_GIFTS,
+    "🔑 По ключевой фразе": SEARCH_METHOD_KEYWORD,
+}
+SEARCH_METHOD_LABELS = {v: k for k, v in SEARCH_METHOD_BUTTONS.items()}
+
+MAX_GIFT_PARTICIPANTS = 300  # сколько участников канала проверять на подарки за один прогон
+MAX_KEYWORD_RESULTS = 200  # сколько постов просматривать при глобальном поиске по фразе
 
 telethon_clients = [
     TelegramClient(name, API_ID, API_HASH, connection_retries=10, retry_delay=3)
@@ -799,13 +819,14 @@ def fmt_datetime(ts: float) -> str:
 class ProgressTracker:
     def __init__(
         self, status_msg, total_posts: int, channels_total: int, account_label: str = "",
-        on_update: "callable | None" = None,
+        on_update: "callable | None" = None, unit_label: str = "Пост",
     ):
         self.status_msg = status_msg
         self.total_posts = max(total_posts, 1)
         self.channels_total = channels_total
         self.account_label = f" [{account_label}]" if account_label else ""
         self.on_update = on_update
+        self.unit_label = unit_label  # "Пост"/"Участник" и т.п. — что именно считаем в прогрессе
         self.posts_done = 0
         self.channels_done = 0
         self.channel_found_counts = {}
@@ -881,7 +902,7 @@ class ProgressTracker:
             text = (
                 f"⚡️ <b>Парсинг</b>{self.account_label} — @{channel}\n\n"
                 f"<b>{percent}%</b>  <code>[{bar}]</code>\n"
-                f"Пост {self.posts_done} из {posts_in_channel}\n\n"
+                f"{self.unit_label} {self.posts_done} из {posts_in_channel}\n\n"
                 f"⏱ {format_duration(elapsed)} · осталось {eta_text}\n"
                 f"✨ Найдено: <b>{total_found}</b>"
             )
@@ -1128,6 +1149,263 @@ async def parse_channel(
     return results, filtered_out, info
 
 
+async def _check_candidate_channels(
+    user, client: TelegramClient, min_subs: int, max_subs: int,
+    results: list, filtered_out: list,
+) -> None:
+    """Общий кусок для find_via_gifts: смотрит био/каналы человека (участника или
+    дарителя) и раскладывает найденные каналы по results/filtered_out — тот же
+    формат записи, что и у parse_channel, чтобы дальше всё (база, рассылка,
+    мини-апп) работало одинаково независимо от способа поиска."""
+    if not isinstance(user, User) or user.bot or getattr(user, 'deleted', False):
+        return
+    bio, candidate_channels = await get_user_bio_and_channels(user, client)
+    if not candidate_channels:
+        return
+    for ch_username in candidate_channels:
+        cached = channel_subs_cache.get(ch_username)
+        if cached is not None and (time.time() - cached['ts']) < CHANNEL_CACHE_TTL_SECONDS:
+            subs = cached['subs']
+        else:
+            subs = await get_channel_subscribers(ch_username, client)
+            channel_subs_cache[ch_username] = {'subs': subs, 'ts': time.time()}
+        if subs is None:
+            continue
+        if min_subs <= subs <= max_subs:
+            results.append({
+                'user_id': user.id,
+                'username': user.username,
+                'first_name': user.first_name or "",
+                'last_name': user.last_name or "",
+                'bio': bio[:300],
+                'channel': ch_username,
+                'subscribers': subs,
+            })
+        else:
+            filtered_out.append({'channel': ch_username, 'subscribers': subs})
+
+
+async def find_via_gifts(
+    channel_link: str, min_subs: int, max_subs: int,
+    *, client: TelegramClient, seen_users: set, tracker: "ProgressTracker",
+    channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
+):
+    """Способ поиска "через подарки": идёт по участникам канала, смотрит их био
+    (как обычный парсинг), и ДОПОЛНИТЕЛЬНО — их видимых дарителей (кто подарил им
+    подарок на профиль, если отправитель не скрыт) — и тоже смотрит био дарителей.
+    Даритель часто не имеет отношения к каналу напрямую, зато может быть реальным
+    знакомым/партнёром участника — другой срез аудитории, чем комментаторы."""
+    results = []
+    filtered_out = []
+    saved_up_to = 0
+    checked_participants = 0
+    checked_gift_givers = 0
+
+    print(f"▶ find_via_gifts start: @{channel_link}")
+
+    try:
+        entity = await with_timeout(client.get_entity(channel_link), f"get_entity(@{channel_link})")
+    except Exception as e:
+        print(f"❌ @{channel_link}: не удалось открыть канал: {e}")
+        return [], [], f"❌ Не удалось открыть канал: {e}"
+
+    await tracker.channel_started(channel_link, channel_idx)
+
+    try:
+        async for participant in client.iter_participants(entity, limit=MAX_GIFT_PARTICIPANTS):
+            checked_participants += 1
+
+            if participant.id not in seen_users:
+                seen_users.add(participant.id)
+                try:
+                    await _check_candidate_channels(participant, client, min_subs, max_subs, results, filtered_out)
+                except Exception as e:
+                    print(f"⚠️ find_via_gifts(@{channel_link}) участник {participant.id}: {type(e).__name__}: {e}")
+
+            # Видимые дарители этого участника
+            try:
+                gifts = await with_timeout(
+                    client(GetSavedStarGiftsRequest(peer=participant, offset="", limit=100)),
+                    f"GetSavedStarGifts({participant.id})",
+                )
+            except Exception as e:
+                gifts = None
+                print(f"⚠️ GetSavedStarGifts({participant.id}) на @{channel_link}: {type(e).__name__}: {e}")
+
+            if gifts is not None:
+                gift_users = {u.id: u for u in gifts.users}
+                for g in gifts.gifts:
+                    if g.name_hidden or g.from_id is None:
+                        continue
+                    giver_id = getattr(g.from_id, 'user_id', None)
+                    if giver_id is None or giver_id not in gift_users or giver_id in seen_users:
+                        continue
+                    seen_users.add(giver_id)
+                    checked_gift_givers += 1
+                    try:
+                        await _check_candidate_channels(
+                            gift_users[giver_id], client, min_subs, max_subs, results, filtered_out
+                        )
+                    except Exception as e:
+                        print(f"⚠️ find_via_gifts(@{channel_link}) даритель {giver_id}: {type(e).__name__}: {e}")
+
+            await tracker.post_done(channel_link, channel_idx, MAX_GIFT_PARTICIPANTS, len(results))
+
+            if on_new_results is not None and len(results) > saved_up_to:
+                await on_new_results(results[saved_up_to:])
+                saved_up_to = len(results)
+    except (ChatAdminRequiredError, ChannelPrivateError) as e:
+        # Список участников у публичных каналов обычно виден только админам —
+        # это ограничение самого Telegram, не временный сбой. Если сорвалось на
+        # первом же участнике (checked_participants <= 1), значит список закрыт
+        # целиком, и дальше пробовать нет смысла — явно говорим пользователю, а не
+        # молча возвращаем 0 результатов, будто просто никого не нашли.
+        if checked_participants <= 1:
+            print(f"❌ find_via_gifts(@{channel_link}): список участников недоступен ({type(e).__name__})")
+            return [], [], "❌ Список участников канала недоступен (нужны права администратора этого канала)"
+        print(f"⚠️ find_via_gifts(@{channel_link}) прервано на {checked_participants}-м участнике: {type(e).__name__}: {e}")
+    except Exception as e:
+        print(f"⚠️ find_via_gifts(@{channel_link}) прервано: {type(e).__name__}: {e}")
+
+    info = (f"Участников проверено: {checked_participants} | "
+            f"Дарителей проверено: {checked_gift_givers} | "
+            f"Подошло: {len(results)}")
+    return results, filtered_out, info
+
+
+async def _resolve_channel_owner(chat, client: TelegramClient):
+    """Пытается найти создателя канала (для метода "по фразе" — у найденного через
+    совпадение в тексте канала нет "человека" сам по себе, нужен настоящий контакт,
+    иначе запись в базе будет нерабочей для рассылки). None, если не получилось
+    (создатель скрыт, канал слишком закрытый и т.п.) — тогда результат просто
+    пропускаем, не кладём в базу нерабочую запись."""
+    try:
+        result = await with_timeout(
+            client(GetParticipantsRequest(
+                channel=chat, filter=ChannelParticipantsAdmins(), offset=0, limit=50, hash=0,
+            )),
+            f"GetParticipants(admins, @{getattr(chat, 'username', chat.id)})",
+        )
+    except Exception:
+        return None
+    creator_id = next(
+        (p.user_id for p in result.participants if isinstance(p, ChannelParticipantCreator)), None
+    )
+    if creator_id is None:
+        return None
+    return next((u for u in result.users if u.id == creator_id), None)
+
+
+async def find_via_keyword(
+    keyword: str, min_subs: int, max_subs: int,
+    *, client: TelegramClient, seen_channels: set, tracker: "ProgressTracker",
+    on_new_results: "callable | None" = None,
+):
+    """Способ поиска "по ключевой фразе": глобальный поиск по всем публичным постам
+    (SearchGlobalRequest) — находит КАНАЛЫ напрямую по совпадению в тексте поста,
+    а не через чью-то био. Доступно только Premium-аккаунтам — без Premium Telegram
+    режет результаты только уже открытыми чатами, для чужих публичных каналов
+    результатов почти не будет."""
+    results = []
+    filtered_out = []
+    saved_up_to = 0
+    checked_messages = 0
+
+    print(f"▶ find_via_keyword start: '{keyword}'")
+
+    offset_rate = 0
+    offset_peer = None
+    offset_id = 0
+
+    try:
+        while checked_messages < MAX_KEYWORD_RESULTS:
+            page_limit = min(100, MAX_KEYWORD_RESULTS - checked_messages)
+            try:
+                result = await with_timeout(
+                    client(SearchGlobalRequest(
+                        q=keyword,
+                        filter=InputMessagesFilterEmpty(),
+                        min_date=None,
+                        max_date=None,
+                        offset_rate=offset_rate,
+                        offset_peer=offset_peer or InputPeerEmpty(),
+                        offset_id=offset_id,
+                        limit=page_limit,
+                        broadcasts_only=True,
+                    )),
+                    f"SearchGlobal('{keyword}')",
+                )
+            except FloodWaitError as e:
+                if await sleep_flood_wait(e.seconds, f"SearchGlobal('{keyword}')"):
+                    continue
+                break
+            except Exception as e:
+                print(f"⚠️ find_via_keyword('{keyword}'): {type(e).__name__}: {e}")
+                break
+
+            messages = getattr(result, 'messages', [])
+            if not messages:
+                break
+
+            chats_by_id = {c.id: c for c in getattr(result, 'chats', [])}
+
+            for msg in messages:
+                checked_messages += 1
+                peer_id = getattr(getattr(msg, 'peer_id', None), 'channel_id', None)
+                if peer_id is None or peer_id in seen_channels:
+                    continue
+                chat = chats_by_id.get(peer_id)
+                if chat is None or not isinstance(chat, Channel) or not chat.broadcast or not chat.username:
+                    continue
+                seen_channels.add(peer_id)
+
+                username = chat.username.lower()
+                cached = channel_subs_cache.get(username)
+                if cached is not None and (time.time() - cached['ts']) < CHANNEL_CACHE_TTL_SECONDS:
+                    subs = cached['subs']
+                else:
+                    subs = await get_channel_subscribers(username, client)
+                    channel_subs_cache[username] = {'subs': subs, 'ts': time.time()}
+                if subs is None:
+                    continue
+
+                if min_subs <= subs <= max_subs:
+                    # У найденного через фразу канала нет "человека" сам по себе —
+                    # резолвим создателя канала, чтобы запись была настоящим рабочим
+                    # контактом (можно писать/добавить в рассылку), а не заглушкой.
+                    owner = await _resolve_channel_owner(chat, client)
+                    if owner is None:
+                        continue
+                    results.append({
+                        'user_id': owner.id,
+                        'username': owner.username,
+                        'first_name': owner.first_name or "",
+                        'last_name': owner.last_name or "",
+                        'bio': f"Владелец канала @{username}",
+                        'channel': username,
+                        'subscribers': subs,
+                    })
+                else:
+                    filtered_out.append({'channel': username, 'subscribers': subs})
+
+            await tracker.post_done(keyword, 1, MAX_KEYWORD_RESULTS, len(results))
+            if on_new_results is not None and len(results) > saved_up_to:
+                await on_new_results(results[saved_up_to:])
+                saved_up_to = len(results)
+
+            if len(messages) < page_limit:
+                break
+            last = messages[-1]
+            offset_id = last.id
+            offset_rate = getattr(result, 'next_rate', offset_rate) or offset_rate
+            offset_peer = chats_by_id.get(getattr(getattr(last, 'peer_id', None), 'channel_id', None))
+    except Exception as e:
+        print(f"⚠️ find_via_keyword('{keyword}') прервано: {type(e).__name__}: {e}")
+
+    info = f"Постов просмотрено: {checked_messages} | Каналов подошло: {len(results)}"
+    return results, filtered_out, info
+
+
 # ================== КЛАВИАТУРЫ ==================
 
 def main_menu_keyboard():
@@ -1162,6 +1440,13 @@ def linked_accounts_keyboard(can_add: bool, has_any: bool):
         rows.append([KeyboardButton("🗑 Отключить аккаунт")])
     rows.append([KeyboardButton("◀️ Назад")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def search_method_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label)] for label in SEARCH_METHOD_BUTTONS] + [[KeyboardButton("❌ Отмена")]],
+        resize_keyboard=True,
+    )
 
 
 def code_keyboard():
@@ -1673,8 +1958,21 @@ async def _finish_login(update: Update, context: ContextTypes.DEFAULT_TYPE, clie
     return await after_account_ready(update, context)
 
 
+def _reset_parsing_flow_state(context: ContextTypes.DEFAULT_TYPE):
+    """Сбрасывает ключи предыдущей (возможно, отменённой на середине) попытки
+    парсинга. Без этого способ/выбранные аккаунты могли бы просочиться в следующий
+    несвязанный запуск (например, из отменённого "подарков" — в "Парсинг по
+    найденным"), потому что промежуточные хендлеры чистят их не на всех путях."""
+    for key in (
+        'search_method', 'selected_clients', 'selected_slots',
+        'channels', 'keyword', 'posts', 'parse_account_slots',
+    ):
+        context.user_data.pop(key, None)
+
+
 async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    _reset_parsing_flow_state(context)
 
     if not await is_user_account_connected(user_id):
         await parsing_step_reply(
@@ -1707,13 +2005,198 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await parsing_step_reply(
         update, context,
         "🔍 <b>Новый парсинг</b>\n\n"
-        "Пришли ссылку(и) на канал(ы).\n"
+        "Каким способом искать?\n\n"
+        "💬 <b>Через комментарии</b> — авторы комментариев к постам канала, их био "
+        "и личные публичные каналы.\n\n"
+        "🎁 <b>Через подарки</b> — участники канала и их видимые дарители (кто "
+        "подарил им подарок на профиль), их био и каналы.\n\n"
+        "🔑 <b>По ключевой фразе</b> — совпадения во всех публичных постах Telegram "
+        "(нужен Premium хотя бы на одном из выбранных аккаунтов).",
+        parse_mode="HTML",
+        reply_markup=search_method_keyboard(),
+    )
+    return METHOD_SELECT
+
+
+async def _connected_accounts_summary(user_id: int) -> list[tuple[int, str]]:
+    """(слот, отображаемое имя) для всех реально подключённых сейчас аккаунтов."""
+    out = []
+    for slot in user_used_slots(user_id):
+        if not await is_slot_connected(user_id, slot):
+            continue
+        async with _user_clients_lock:
+            client = _user_clients.get((user_id, slot))
+        label = f"аккаунт №{slot}"
+        if client is not None:
+            try:
+                me = await client.get_me()
+                name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"аккаунт №{slot}"
+                premium = " ⭐Premium" if getattr(me, 'premium', False) else ""
+                label = f"{name}{premium}"
+            except Exception:
+                pass
+        out.append((slot, label))
+    return out
+
+
+async def select_search_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "❌ Отмена":
+        await parsing_step_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    method = SEARCH_METHOD_BUTTONS.get(text)
+    if method is None:
+        await parsing_step_reply(
+            update, context, "Выбери способ поиска кнопкой ниже.", reply_markup=search_method_keyboard()
+        )
+        return METHOD_SELECT
+
+    context.user_data['search_method'] = method
+    user_id = update.effective_user.id
+
+    accounts = await _connected_accounts_summary(user_id)
+    if not accounts:
+        await parsing_step_reply(
+            update, context,
+            "🔌 Нет подключённых аккаунтов — зайди в «🔗 Привязанные аккаунты».",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    context.user_data['parse_account_slots'] = [slot for slot, _ in accounts]
+    listing = "\n".join(f"{slot}. {html.escape(label)}" for slot, label in accounts)
+    hint = (
+        "\n\n⚠️ Для этого способа нужен Premium хотя бы на одном из выбранных."
+        if method == SEARCH_METHOD_KEYWORD else ""
+    )
+
+    await parsing_step_reply(
+        update, context,
+        f"Способ: <b>{html.escape(SEARCH_METHOD_LABELS[method])}</b>\n\n"
+        f"Какие аккаунты использовать? (несколько — быстрее, если каналов в запросе тоже несколько)\n\n"
+        f"{listing}{hint}\n\n"
+        "Напиши номера через запятую и/или диапазоны (например 1,3) или «все».",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+    return PARSE_ACCOUNT_SELECT
+
+
+async def select_parse_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    user_id = update.effective_user.id
+
+    if text == "❌ Отмена":
+        context.user_data.pop('parse_account_slots', None)
+        context.user_data.pop('search_method', None)
+        await parsing_step_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    available_slots = context.user_data.get('parse_account_slots', [])
+    if text.lower() in ("все", "всё", "all"):
+        chosen_slots = list(available_slots)
+    else:
+        indices = _parse_selection(text, max(available_slots) if available_slots else 0)
+        chosen_slots = [i for i in (indices or []) if i in available_slots]
+
+    if not chosen_slots:
+        await parsing_step_reply(
+            update, context,
+            "Не понял выбор. Напиши номера из списка выше или «все».",
+            reply_markup=cancel_keyboard(),
+        )
+        return PARSE_ACCOUNT_SELECT
+
+    method = context.user_data.get('search_method', SEARCH_METHOD_COMMENTS)
+
+    clients = []
+    for slot in chosen_slots:
+        async with _user_clients_lock:
+            client = _user_clients.get((user_id, slot))
+        if client is not None:
+            clients.append(client)
+
+    if not clients:
+        await parsing_step_reply(
+            update, context,
+            "Выбранные аккаунты сейчас недоступны, попробуй ещё раз.",
+            reply_markup=cancel_keyboard(),
+        )
+        return PARSE_ACCOUNT_SELECT
+
+    if method == SEARCH_METHOD_KEYWORD:
+        premium_clients = []
+        for c in clients:
+            try:
+                me = await c.get_me()
+                if getattr(me, 'premium', False):
+                    premium_clients.append(c)
+            except Exception:
+                pass
+        if not premium_clients:
+            await parsing_step_reply(
+                update, context,
+                "⚠️ Ни у одного из выбранных аккаунтов нет Telegram Premium — без него "
+                "этот способ почти не даёт результатов. Выбери другой аккаунт из списка "
+                "выше или начни заново с другого способа поиска.",
+                reply_markup=cancel_keyboard(),
+            )
+            return PARSE_ACCOUNT_SELECT
+        clients = premium_clients
+
+    context.user_data['selected_clients'] = clients
+    context.user_data['selected_slots'] = chosen_slots
+    context.user_data.pop('parse_account_slots', None)
+
+    if method == SEARCH_METHOD_KEYWORD:
+        await parsing_step_reply(
+            update, context,
+            "Введи ключевую фразу для поиска (короткая фраза работает лучше длинного предложения):",
+            reply_markup=cancel_keyboard(),
+        )
+        return KEYWORD_INPUT
+
+    await parsing_step_reply(
+        update, context,
+        "🔍 Пришли ссылку(и) на канал(ы).\n"
         "Можно несколько через пробел или с новой строки.\n\n"
         "Пример:\n<code>https://t.me/durov</code>\n<code>@channelname</code>",
         parse_mode="HTML",
         reply_markup=cancel_keyboard(),
     )
     return CHANNELS
+
+
+async def get_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == "❌ Отмена":
+        context.user_data.pop('selected_clients', None)
+        context.user_data.pop('selected_slots', None)
+        context.user_data.pop('search_method', None)
+        await parsing_step_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    if len(text) < 2:
+        await parsing_step_reply(
+            update, context, "Слишком короткая фраза, попробуй подробнее.", reply_markup=cancel_keyboard()
+        )
+        return KEYWORD_INPUT
+
+    context.user_data['keyword'] = text
+    await parsing_step_reply(
+        update, context,
+        "Укажи диапазон подписчиков.\n\n"
+        "Примеры:\n"
+        "<code>1000-10000</code>\n"
+        "<code>5000</code> (от 5000 и выше)\n"
+        "<code>0-5000</code>",
+        parse_mode="HTML",
+        reply_markup=cancel_keyboard(),
+    )
+    return SUBS_RANGE
 
 
 def unique_found_channels(user_id_str: str) -> list[dict]:
@@ -1741,6 +2224,7 @@ def _reparse_select_prompt(channels: list[dict]) -> list[str]:
 async def start_reparse_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+    _reset_parsing_flow_state(context)
 
     if not await is_user_account_connected(user_id):
         await update.message.reply_text("🔌 Сначала подключите аккаунт — «🔗 Привязанные аккаунты» в меню.")
@@ -2398,6 +2882,21 @@ async def get_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHANNELS
 
     context.user_data['channels'] = links
+    method = context.user_data.get('search_method', SEARCH_METHOD_COMMENTS)
+
+    if method == SEARCH_METHOD_GIFTS:
+        # "Через подарки" смотрит участников канала, число постов тут не при чём —
+        # сразу к диапазону подписчиков.
+        await parsing_step_reply(
+            update, context,
+            f"Каналы: {', '.join('@'+c for c in context.user_data['channels'])}\n\n"
+            "Укажи диапазон подписчиков.\n\n"
+            "Примеры:\n<code>1000-10000</code>\n<code>5000</code> (от 5000 и выше)\n<code>0-5000</code>",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard(),
+        )
+        return SUBS_RANGE
+
     await parsing_step_reply(
         update, context,
         f"Каналы: {', '.join('@'+c for c in context.user_data['channels'])}\n\n"
@@ -2459,8 +2958,10 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if min_subs > max_subs:
         min_subs, max_subs = max_subs, min_subs
 
-    posts = context.user_data['posts']
-    channels = context.user_data['channels']
+    posts = context.user_data.get('posts')  # None для "подарки"/"фраза" — там не нужно
+    channels = context.user_data.get('channels')  # None для "фраза" — там нет каналов
+    keyword = context.user_data.get('keyword')  # только для "фраза"
+    method = context.user_data.pop('search_method', SEARCH_METHOD_COMMENTS)
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
@@ -2475,8 +2976,16 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-    # Хотя бы один личный аккаунт обязателен
-    clients = await get_user_clients(user_id)
+    # Аккаунты, выбранные на шаге "какие аккаунты использовать" — если шаг почему-то
+    # пропущен (например, "Парсинг по найденным" заходит в этот же state machine
+    # напрямую, без выбора метода/аккаунта), берём все подключённые автоматически.
+    clients = context.user_data.pop('selected_clients', None)
+    context.user_data.pop('selected_slots', None)
+    context.user_data.pop('channels', None)
+    context.user_data.pop('keyword', None)
+    context.user_data.pop('posts', None)
+    if not clients:
+        clients = await get_user_clients(user_id)
     if not clients:
         await context.bot.send_message(
             chat_id,
@@ -2499,19 +3008,25 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trial_note = f"🎁 Пробный период — осталось {_format_hm(trial_seconds_left(user_id))}"
 
     async with parse_semaphore:
-        await run_parsing_job(
-            context, chat_id, user_id, channels, posts, min_subs, max_subs, trial_note,
-            clients=clients,
-        )
+        if method == SEARCH_METHOD_KEYWORD:
+            await run_keyword_job(
+                context, chat_id, user_id, keyword, min_subs, max_subs, trial_note,
+                clients=clients,
+            )
+        else:
+            await run_parsing_job(
+                context, chat_id, user_id, channels, posts, min_subs, max_subs, trial_note,
+                clients=clients, method=method,
+            )
 
     return ConversationHandler.END
 
 
 async def run_parsing_job(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
-    channels: list[str], posts: int, min_subs: int, max_subs: int,
+    channels: list[str], posts: int | None, min_subs: int, max_subs: int,
     trial_note: str | None = None,
-    *, clients: list[TelegramClient] | None = None,
+    *, clients: list[TelegramClient] | None = None, method: str = SEARCH_METHOD_COMMENTS,
     notify_chat: bool = True, on_progress: "callable | None" = None,
 ):
     global active_parses
@@ -2538,11 +3053,17 @@ async def run_parsing_job(
 
             trial_line = f"\n{trial_note}" if trial_note else ""
             accounts_line = f" · аккаунтов: {len(clients)}" if len(clients) > 1 else ""
+            posts_line = f"📄 Постов: <b>{posts}</b>\n" if method == SEARCH_METHOD_COMMENTS else ""
+            method_line = (
+                f"🔎 Способ: <b>{html.escape(SEARCH_METHOD_LABELS.get(method, method))}</b>\n"
+                if method != SEARCH_METHOD_COMMENTS else ""
+            )
             status_msg = await context.bot.send_message(
                 chat_id,
                 f"⚡️ <b>Запускаю парсинг</b>{trial_line}\n\n"
+                f"{method_line}"
                 f"📡 Каналов: <b>{len(channels)}</b>{accounts_line}\n"
-                f"📄 Постов: <b>{posts}</b>\n"
+                f"{posts_line}"
                 f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n\n"
                 "Это может занять несколько минут…",
                 parse_mode="HTML",
@@ -2553,10 +3074,12 @@ async def run_parsing_job(
         debug_info: list[str | None] = [None] * len(channels)
 
         seen_users = set()
+        per_channel_unit = MAX_GIFT_PARTICIPANTS if method == SEARCH_METHOD_GIFTS else (posts or 1)
         tracker = ProgressTracker(
-            status_msg, total_posts=posts * len(channels), channels_total=len(channels),
+            status_msg, total_posts=per_channel_unit * len(channels), channels_total=len(channels),
             account_label="личный" if len(clients) == 1 else f"{len(clients)} акк.",
             on_update=on_progress,
+            unit_label="Участник" if method == SEARCH_METHOD_GIFTS else "Пост",
         )
 
         user_id_str = str(user_id)
@@ -2588,17 +3111,28 @@ async def run_parsing_job(
                     idx, ch = channel_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                channel_timeout = max(300, posts * 30)
+                channel_timeout = max(300, posts * 30) if method == SEARCH_METHOD_COMMENTS else 900
                 try:
-                    results, filtered_out, info = await asyncio.wait_for(
-                        parse_channel(
-                            ch, posts, min_subs, max_subs,
-                            client=worker_client, seen_users=seen_users, tracker=tracker,
-                            channel_idx=idx, channels_total=len(channels),
-                            on_new_results=on_new_results,
-                        ),
-                        timeout=channel_timeout,
-                    )
+                    if method == SEARCH_METHOD_GIFTS:
+                        results, filtered_out, info = await asyncio.wait_for(
+                            find_via_gifts(
+                                ch, min_subs, max_subs,
+                                client=worker_client, seen_users=seen_users, tracker=tracker,
+                                channel_idx=idx, channels_total=len(channels),
+                                on_new_results=on_new_results,
+                            ),
+                            timeout=channel_timeout,
+                        )
+                    else:
+                        results, filtered_out, info = await asyncio.wait_for(
+                            parse_channel(
+                                ch, posts, min_subs, max_subs,
+                                client=worker_client, seen_users=seen_users, tracker=tracker,
+                                channel_idx=idx, channels_total=len(channels),
+                                on_new_results=on_new_results,
+                            ),
+                            timeout=channel_timeout,
+                        )
                 except asyncio.TimeoutError:
                     print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
                     results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
@@ -2612,86 +3146,200 @@ async def run_parsing_job(
         # параллельно (каждый своим аккаунтом), а не строго один за другим.
         await asyncio.gather(*(channel_worker(c) for c in clients))
 
-        await save_channel_cache_async(channel_subs_cache)
-        await save_user_cache_async(user_info_cache)
-        await tracker.finish(len(all_results))
+        return await _finalize_and_report(
+            context, chat_id, user_id_str, all_results, all_filtered_out, debug_info,
+            pairs_before_job, tracker, notify_chat,
+        )
+    finally:
+        active_parses -= 1
 
-        unique = {(r['user_id'], r['channel']): r for r in all_results}.values()
-        unique = sorted(unique, key=lambda x: x['subscribers'], reverse=True)
 
-        by_pair_in_db = {(item['user_id'], item['channel']): item for item in user_databases[user_id_str]}
-        new_pairs = {pair for pair in by_pair_in_db if pair not in pairs_before_job}
-        for r in unique:
-            pair = (r['user_id'], r['channel'])
-            r['found_at'] = by_pair_in_db.get(pair, {}).get('found_at', time.time())
-            r['is_new'] = pair in new_pairs
+async def _finalize_and_report(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id_str: str,
+    all_results: list, all_filtered_out: list, debug_info: list,
+    pairs_before_job: set, tracker: "ProgressTracker", notify_chat: bool,
+) -> dict:
+    """Общий хвост для run_parsing_job/run_keyword_job: сохранить кэши, посчитать
+    итог, разослать отчёт в чат (если notify_chat) — не зависит от способа поиска."""
+    await save_channel_cache_async(channel_subs_cache)
+    await save_user_cache_async(user_info_cache)
+    await tracker.finish(len(all_results))
 
-        rejected = {}
-        for item in all_filtered_out:
-            ch = item['channel']
-            if ch not in rejected:
-                rejected[ch] = {'channel': ch, 'subscribers': item['subscribers'], 'count': 0}
-            rejected[ch]['count'] += 1
-        rejected_list = sorted(rejected.values(), key=lambda x: x['subscribers'], reverse=True)
+    unique = {(r['user_id'], r['channel']): r for r in all_results}.values()
+    unique = sorted(unique, key=lambda x: x['subscribers'], reverse=True)
 
-        if notify_chat:
-            debug_header = "📊 <b>Статистика:</b>\n"
-            debug_entries = [html.escape(line) + "\n" for line in debug_info if line]
-            for chunk in _chunk_parts([debug_header] + debug_entries, sep=""):
+    by_pair_in_db = {(item['user_id'], item['channel']): item for item in user_databases[user_id_str]}
+    new_pairs = {pair for pair in by_pair_in_db if pair not in pairs_before_job}
+    for r in unique:
+        pair = (r['user_id'], r['channel'])
+        r['found_at'] = by_pair_in_db.get(pair, {}).get('found_at', time.time())
+        r['is_new'] = pair in new_pairs
+
+    rejected = {}
+    for item in all_filtered_out:
+        ch = item['channel']
+        if ch not in rejected:
+            rejected[ch] = {'channel': ch, 'subscribers': item['subscribers'], 'count': 0}
+        rejected[ch]['count'] += 1
+    rejected_list = sorted(rejected.values(), key=lambda x: x['subscribers'], reverse=True)
+
+    if notify_chat:
+        debug_header = "📊 <b>Статистика:</b>\n"
+        debug_entries = [html.escape(line) + "\n" for line in debug_info if line]
+        for chunk in _chunk_parts([debug_header] + debug_entries, sep=""):
+            await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+
+        if not unique:
+            await context.bot.send_message(
+                chat_id,
+                "Никого не нашёл по заданным критериям.",
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            new_count = len(new_pairs)
+            already_count = len(unique) - new_count
+            unique_people = len({r['user_id'] for r in unique})
+            report_header = (
+                f"✅ <b>Найдено {len(unique)} результатов</b> (людей: {unique_people}) "
+                f"(новых: {new_count}, уже было в базе: {already_count}):\n"
+            )
+            report_entries = []
+            for i, r in enumerate(unique, 1):
+                status_icon = "✅" if (r['user_id'], r['channel']) in new_pairs else "❌"
+                name = html.escape(f"{r['first_name']} {r['last_name']}".strip()) or "Без имени"
+                if r['username']:
+                    person_link = f"https://t.me/{r['username']}"
+                    uname = f"@{r['username']}"
+                else:
+                    person_link = f"tg://user?id={r['user_id']}"
+                    uname = f"id{r['user_id']}"
+
+                channel_link = f"https://t.me/{html.escape(r['channel'])}"
+                bio = html.escape(r['bio'][:150])
+                found_when = fmt_datetime(r.get('found_at', time.time()))
+
+                report_entries.append(
+                    f"{status_icon} <b>{i}. {name}</b> ({uname})\n"
+                    f"👤 Профиль: {person_link}\n"
+                    f"📢 Канал: {channel_link}\n"
+                    f"👥 Подписчиков: <b>{r['subscribers']:,}</b>\n"
+                    f"🕒 Найден: {found_when}\n"
+                    f"📝 Био: {bio}{'...' if len(r['bio']) > 150 else ''}\n"
+                )
+
+            for chunk in _chunk_parts([report_header] + report_entries, sep="\n"):
                 await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
 
-            if not unique:
+            await context.bot.send_message(
+                chat_id,
+                "Готово! Новые результаты (✅) сохранены в «Моя база каналов». "
+                "Отмеченные ❌ там уже были раньше.",
+                reply_markup=main_menu_keyboard()
+            )
+
+        # Каналы, не прошедшие фильтр по подписчикам, пользователю не показываем —
+        # это шум, не относящийся к результату по заданным критериям.
+
+    return {'results': unique, 'rejected': rejected_list}
+
+
+async def run_keyword_job(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int,
+    keyword: str, min_subs: int, max_subs: int, trial_note: str | None = None,
+    *, clients: list[TelegramClient] | None = None,
+    notify_chat: bool = True, on_progress: "callable | None" = None,
+):
+    """Способ "по ключевой фразе" — глобальный поиск, каналов/распределения по
+    аккаунтам тут нет (это одна операция, не набор независимых каналов), поэтому
+    используется только ПЕРВЫЙ переданный клиент (уже отфильтрован на Premium
+    там, где выбирались аккаунты)."""
+    global active_parses
+
+    if clients is None:
+        clients = await get_user_clients(user_id)
+    if not clients:
+        if notify_chat:
+            await context.bot.send_message(
+                chat_id,
+                "🔌 Аккаунт не подключён. Зайди в «🔗 Привязанные аккаунты» и подключи хотя бы один.",
+                reply_markup=main_menu_keyboard(),
+            )
+        return {'results': [], 'rejected': []}
+
+    client = clients[0]
+    await ensure_connected(client, "личный")
+
+    try:
+        me = await client.get_me()
+        if not getattr(me, 'premium', False):
+            if notify_chat:
                 await context.bot.send_message(
                     chat_id,
-                    "Никого не нашёл по заданным критериям.",
-                    reply_markup=main_menu_keyboard()
+                    "⚠️ Для поиска по ключевой фразе нужен Telegram Premium на выбранном "
+                    "аккаунте — без него результатов почти не будет.",
+                    reply_markup=main_menu_keyboard(),
                 )
-            else:
-                new_count = len(new_pairs)
-                already_count = len(unique) - new_count
-                unique_people = len({r['user_id'] for r in unique})
-                report_header = (
-                    f"✅ <b>Найдено {len(unique)} результатов</b> (людей: {unique_people}) "
-                    f"(новых: {new_count}, уже было в базе: {already_count}):\n"
-                )
-                report_entries = []
-                for i, r in enumerate(unique, 1):
-                    status_icon = "✅" if (r['user_id'], r['channel']) in new_pairs else "❌"
-                    name = html.escape(f"{r['first_name']} {r['last_name']}".strip()) or "Без имени"
-                    if r['username']:
-                        person_link = f"https://t.me/{r['username']}"
-                        uname = f"@{r['username']}"
-                    else:
-                        person_link = f"tg://user?id={r['user_id']}"
-                        uname = f"id{r['user_id']}"
+            return {'results': [], 'rejected': []}
+    except Exception:
+        pass
 
-                    channel_link = f"https://t.me/{html.escape(r['channel'])}"
-                    bio = html.escape(r['bio'][:150])
-                    found_when = fmt_datetime(r.get('found_at', time.time()))
+    active_parses += 1
+    try:
+        status_msg = None
+        if notify_chat:
+            await context.bot.send_message(chat_id, "⏳ Запускаю поиск...", reply_markup=ReplyKeyboardRemove())
+            trial_line = f"\n{trial_note}" if trial_note else ""
+            status_msg = await context.bot.send_message(
+                chat_id,
+                f"⚡️ <b>Запускаю поиск по фразе</b>{trial_line}\n\n"
+                f"🔑 Фраза: <b>{html.escape(keyword)}</b>\n"
+                f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n\n"
+                "Это может занять несколько минут…",
+                parse_mode="HTML",
+            )
 
-                    report_entries.append(
-                        f"{status_icon} <b>{i}. {name}</b> ({uname})\n"
-                        f"👤 Профиль: {person_link}\n"
-                        f"📢 Канал: {channel_link}\n"
-                        f"👥 Подписчиков: <b>{r['subscribers']:,}</b>\n"
-                        f"🕒 Найден: {found_when}\n"
-                        f"📝 Био: {bio}{'...' if len(r['bio']) > 150 else ''}\n"
-                    )
+        seen_channels: set = set()
+        tracker = ProgressTracker(
+            status_msg, total_posts=MAX_KEYWORD_RESULTS, channels_total=1,
+            account_label="Premium-аккаунт", on_update=on_progress, unit_label="Пост",
+        )
 
-                for chunk in _chunk_parts([report_header] + report_entries, sep="\n"):
-                    await context.bot.send_message(chat_id, chunk, parse_mode="HTML")
+        user_id_str = str(user_id)
+        if user_id_str not in user_databases:
+            user_databases[user_id_str] = []
+        pairs_before_job = {(item['user_id'], item['channel']) for item in user_databases[user_id_str]}
 
-                await context.bot.send_message(
-                    chat_id,
-                    "Готово! Новые результаты (✅) сохранены в «Моя база каналов». "
-                    "Отмеченные ❌ там уже были раньше.",
-                    reply_markup=main_menu_keyboard()
-                )
+        async def on_new_results(new_batch):
+            existing_pairs = {(item['user_id'], item['channel']) for item in user_databases[user_id_str]}
+            added = False
+            for r in {(x['user_id'], x['channel']): x for x in new_batch}.values():
+                pair = (r['user_id'], r['channel'])
+                if pair not in existing_pairs:
+                    r['found_at'] = time.time()
+                    user_databases[user_id_str].append(r)
+                    existing_pairs.add(pair)
+                    added = True
+            if added:
+                await save_databases_async(user_databases)
 
-            # Каналы, не прошедшие фильтр по подписчикам, пользователю не показываем —
-            # это шум, не относящийся к результату парсинга по заданным критериям.
+        try:
+            all_results, all_filtered_out, info = await asyncio.wait_for(
+                find_via_keyword(
+                    keyword, min_subs, max_subs,
+                    client=client, seen_channels=seen_channels, tracker=tracker,
+                    on_new_results=on_new_results,
+                ),
+                timeout=900,
+            )
+        except asyncio.TimeoutError:
+            print(f"⚠️ find_via_keyword('{keyword}'): общий таймаут")
+            all_results, all_filtered_out, info = [], [], "❌ Таймаут поиска"
+        await tracker.channel_done()
 
-        return {'results': unique, 'rejected': rejected_list}
+        return await _finalize_and_report(
+            context, chat_id, user_id_str, all_results, all_filtered_out, [f"'{keyword}': {info}"],
+            pairs_before_job, tracker, notify_chat,
+        )
     finally:
         active_parses -= 1
 
@@ -2957,6 +3605,9 @@ async def main():
             ACCOUNTS_DISCONNECT_SELECT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, connect_disconnect_selection)
             ],
+            METHOD_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_search_method)],
+            PARSE_ACCOUNT_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, select_parse_accounts)],
+            KEYWORD_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_keyword)],
         },
         fallbacks=[
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel),
