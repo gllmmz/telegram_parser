@@ -124,11 +124,13 @@ METHOD_SELECT, PARSE_ACCOUNT_SELECT, KEYWORD_INPUT = range(11, 14)
 SEARCH_METHOD_COMMENTS = 'comments'
 SEARCH_METHOD_GIFTS = 'gifts'
 SEARCH_METHOD_KEYWORD = 'keyword'
+SEARCH_METHOD_DEEP = 'deep'
 
 SEARCH_METHOD_BUTTONS = {
     "💬 Через комментарии": SEARCH_METHOD_COMMENTS,
     "🎁 Через подарки": SEARCH_METHOD_GIFTS,
     "🔑 По ключевой фразе": SEARCH_METHOD_KEYWORD,
+    "🧬 Углублённый поиск": SEARCH_METHOD_DEEP,
 }
 SEARCH_METHOD_LABELS = {v: k for k, v in SEARCH_METHOD_BUTTONS.items()}
 
@@ -932,12 +934,18 @@ async def parse_channel(
     channel_link: str, posts_limit: int, min_subs: int, max_subs: int,
     *, client: TelegramClient, seen_users: set, tracker: "ProgressTracker",
     channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
+    also_check_gift_givers: bool = False,
 ):
+    """also_check_gift_givers включает "углублённый поиск" — для каждого автора
+    комментария дополнительно смотрим его видимых дарителей (кто подарил ему
+    подарок на профиль) и их био, как в find_via_gifts. Даёт больше кандидатов
+    ценой доп. запросов на каждого комментатора."""
     results = []
     filtered_out = []
     total_comments = 0
     users_with_channels = 0
     channels_found = 0
+    gift_givers_checked = 0
     saved_up_to = 0
     switch_count = 0
     channel_seen_this_attempt = set()
@@ -1023,7 +1031,7 @@ async def parse_channel(
         return subs
 
     async def process_comment(comment):
-        nonlocal total_comments, users_with_channels, channels_found
+        nonlocal total_comments, users_with_channels, channels_found, gift_givers_checked
 
         sender_id = getattr(comment, 'sender_id', None) or getattr(comment, 'from_id', None)
         if not sender_id:
@@ -1048,30 +1056,56 @@ async def parse_channel(
                 return
 
             bio, candidate_channels = await get_user_bio_and_channels(user, client)
-            if not candidate_channels:
-                return
+            if candidate_channels:
+                users_with_channels += 1
+                for ch_username in candidate_channels:
+                    channels_found += 1
+                    subs = await get_cached_subs(ch_username)
 
-            users_with_channels += 1
+                    if subs is None:
+                        continue
 
-            for ch_username in candidate_channels:
-                channels_found += 1
-                subs = await get_cached_subs(ch_username)
+                    if min_subs <= subs <= max_subs:
+                        results.append({
+                            'user_id': user.id,
+                            'username': user.username,
+                            'first_name': user.first_name or "",
+                            'last_name': user.last_name or "",
+                            'bio': bio[:300],
+                            'channel': ch_username,
+                            'subscribers': subs,
+                        })
+                    else:
+                        filtered_out.append({'channel': ch_username, 'subscribers': subs})
 
-                if subs is None:
-                    continue
+            # Углублённый поиск: смотрим ещё и видимых дарителей комментатора —
+            # независимо от того, нашлись ли каналы в его собственном био.
+            if also_check_gift_givers:
+                try:
+                    gifts = await with_timeout(
+                        client(GetSavedStarGiftsRequest(peer=user, offset="", limit=100)),
+                        f"GetSavedStarGifts({user.id})",
+                    )
+                except Exception as e:
+                    gifts = None
+                    print(f"⚠️ GetSavedStarGifts({user.id}) на @{channel_link}: {type(e).__name__}: {e}")
 
-                if min_subs <= subs <= max_subs:
-                    results.append({
-                        'user_id': user.id,
-                        'username': user.username,
-                        'first_name': user.first_name or "",
-                        'last_name': user.last_name or "",
-                        'bio': bio[:300],
-                        'channel': ch_username,
-                        'subscribers': subs,
-                    })
-                else:
-                    filtered_out.append({'channel': ch_username, 'subscribers': subs})
+                if gifts is not None:
+                    gift_users = {u.id: u for u in gifts.users}
+                    for g in gifts.gifts:
+                        if g.name_hidden or g.from_id is None:
+                            continue
+                        giver_id = getattr(g.from_id, 'user_id', None)
+                        if giver_id is None or giver_id not in gift_users or giver_id in seen_users:
+                            continue
+                        seen_users.add(giver_id)
+                        gift_givers_checked += 1
+                        try:
+                            await _check_candidate_channels(
+                                gift_users[giver_id], client, min_subs, max_subs, results, filtered_out
+                            )
+                        except Exception as e:
+                            print(f"⚠️ deep-search даритель {giver_id}: {type(e).__name__}: {e}")
 
     async def collect_via_iter(msg_id: int):
         result = []
@@ -1141,9 +1175,10 @@ async def parse_channel(
             await asyncio.sleep(delay)
         await process_all_posts(report_progress=False)
 
+    gift_givers_line = f" | Дарителей проверено: {gift_givers_checked}" if also_check_gift_givers else ""
     info = (f"Комментариев: {total_comments} | "
             f"С каналами (био/профиль): {users_with_channels} | "
-            f"Каналов найдено: {channels_found} | "
+            f"Каналов найдено: {channels_found}{gift_givers_line} | "
             f"Подошло: {len(results)}")
 
     return results, filtered_out, info
@@ -2011,7 +2046,10 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎁 <b>Через подарки</b> — участники канала и их видимые дарители (кто "
         "подарил им подарок на профиль), их био и каналы.\n\n"
         "🔑 <b>По ключевой фразе</b> — совпадения во всех публичных постах Telegram "
-        "(нужен Premium хотя бы на одном из выбранных аккаунтов).",
+        "(нужен Premium хотя бы на одном из выбранных аккаунтов).\n\n"
+        "🧬 <b>Углублённый поиск</b> — авторы комментариев, их каналы, "
+        "и вдобавок видимые дарители самих комментаторов (кто дарил им подарки), "
+        "их био и каналы. Даёт больше кандидатов, но идёт медленнее.",
         parse_mode="HTML",
         reply_markup=search_method_keyboard(),
     )
@@ -3053,7 +3091,10 @@ async def run_parsing_job(
 
             trial_line = f"\n{trial_note}" if trial_note else ""
             accounts_line = f" · аккаунтов: {len(clients)}" if len(clients) > 1 else ""
-            posts_line = f"📄 Постов: <b>{posts}</b>\n" if method == SEARCH_METHOD_COMMENTS else ""
+            posts_line = (
+                f"📄 Постов: <b>{posts}</b>\n"
+                if method in (SEARCH_METHOD_COMMENTS, SEARCH_METHOD_DEEP) else ""
+            )
             method_line = (
                 f"🔎 Способ: <b>{html.escape(SEARCH_METHOD_LABELS.get(method, method))}</b>\n"
                 if method != SEARCH_METHOD_COMMENTS else ""
@@ -3111,7 +3152,14 @@ async def run_parsing_job(
                     idx, ch = channel_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                channel_timeout = max(300, posts * 30) if method == SEARCH_METHOD_COMMENTS else 900
+                if method == SEARCH_METHOD_COMMENTS:
+                    channel_timeout = max(300, posts * 30)
+                elif method == SEARCH_METHOD_DEEP:
+                    # Углублённый поиск делает доп. запросы (подарки) на каждого
+                    # комментатора — даём заметно больше времени на канал.
+                    channel_timeout = max(600, posts * 60)
+                else:
+                    channel_timeout = 900
                 try:
                     if method == SEARCH_METHOD_GIFTS:
                         results, filtered_out, info = await asyncio.wait_for(
@@ -3130,6 +3178,7 @@ async def run_parsing_job(
                                 client=worker_client, seen_users=seen_users, tracker=tracker,
                                 channel_idx=idx, channels_total=len(channels),
                                 on_new_results=on_new_results,
+                                also_check_gift_givers=(method == SEARCH_METHOD_DEEP),
                             ),
                             timeout=channel_timeout,
                         )
