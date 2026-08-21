@@ -132,6 +132,7 @@
     if (name === "database") loadDatabase();
     if (name === "account") loadAccount();
     if (name === "reparse") loadReparseChannels();
+    if (name === "parsing") { renderMethods(); updateFormVisibility(); loadPfAccounts(); }
   }
 
   document.querySelectorAll("[data-nav]").forEach(function (el) {
@@ -150,6 +151,90 @@
   // ---------- Новый парсинг ----------
   var pollTimer = null;
 
+  var METHODS = [
+    { id: "comments", icon: "💬", title: "Через комментарии",
+      desc: "Авторы комментариев к постам канала, их био и личные публичные каналы." },
+    { id: "gifts", icon: "🎁", title: "Через подарки",
+      desc: "Участники канала и их видимые дарители (кто подарил им подарок на профиль), их био и каналы." },
+    { id: "keyword", icon: "🔑", title: "По ключевой фразе",
+      desc: "Совпадения во всех публичных постах Telegram. Нужен Premium хотя бы на одном из выбранных аккаунтов." },
+    { id: "deep", icon: "🧬", title: "Углублённый поиск",
+      desc: "Комментаторы и их каналы + вдобавок видимые дарители самих комментаторов, их био и каналы. Больше кандидатов, но медленнее." },
+  ];
+  var pfMethod = "comments";
+  var pfAccounts = [];
+  var pfSelectedSlots = {};
+
+  function renderMethods() {
+    var el = document.getElementById("pf-methods");
+    el.innerHTML = METHODS.map(function (m) {
+      var sel = m.id === pfMethod;
+      return '<div class="opt-item' + (sel ? ' selected' : '') + '" data-method="' + m.id + '">' +
+        '<div class="check">' + (sel ? "✓" : "") + '</div>' +
+        '<div class="opt-body"><div class="opt-title">' + m.icon + ' ' + esc(m.title) + '</div>' +
+        '<div class="opt-desc">' + esc(m.desc) + '</div></div></div>';
+    }).join("");
+  }
+
+  document.getElementById("pf-methods").addEventListener("click", function (e) {
+    var row = e.target.closest(".opt-item");
+    if (!row) return;
+    pfMethod = row.getAttribute("data-method");
+    renderMethods();
+    updateFormVisibility();
+  });
+
+  function renderAccounts() {
+    var el = document.getElementById("pf-accounts");
+    if (!pfAccounts.length) {
+      el.innerHTML = '<div class="empty-state">Нет подключённых аккаунтов — открой бота и нажми «🔗 Привязанные аккаунты».</div>';
+      return;
+    }
+    var isKeyword = pfMethod === "keyword";
+    el.innerHTML = pfAccounts.map(function (a) {
+      var disabled = isKeyword && !a.premium;
+      if (disabled) delete pfSelectedSlots[a.slot];
+      var checked = !!pfSelectedSlots[a.slot];
+      var badge = a.premium ? '<span class="chip" style="margin-left:6px">⭐Premium</span>' : "";
+      return '<div class="opt-item' + (checked ? ' selected' : '') + (disabled ? ' disabled' : '') +
+        '" data-slot="' + a.slot + '">' +
+        '<div class="check">' + (checked ? "✓" : "") + '</div>' +
+        '<div class="opt-body"><div class="opt-title">' + esc(a.label) + badge + '</div>' +
+        (disabled ? '<div class="opt-desc">Нет Premium — недоступен для этого способа</div>' : '') +
+        '</div></div>';
+    }).join("");
+  }
+
+  document.getElementById("pf-accounts").addEventListener("click", function (e) {
+    var row = e.target.closest(".opt-item");
+    if (!row || row.classList.contains("disabled")) return;
+    var slot = Number(row.getAttribute("data-slot"));
+    if (pfSelectedSlots[slot]) delete pfSelectedSlots[slot];
+    else pfSelectedSlots[slot] = true;
+    renderAccounts();
+  });
+
+  function loadPfAccounts() {
+    document.getElementById("pf-accounts").innerHTML = '<div class="empty-state">Загрузка…</div>';
+    get("/api/accounts").then(function (res) {
+      pfAccounts = res.items || [];
+      pfSelectedSlots = {};
+      pfAccounts.forEach(function (a) { pfSelectedSlots[a.slot] = true; });
+      renderAccounts();
+    }).catch(function (e) {
+      document.getElementById("pf-accounts").innerHTML = '<div class="empty-state">Ошибка: ' + esc(e.message) + '</div>';
+    });
+  }
+
+  function updateFormVisibility() {
+    var isKeyword = pfMethod === "keyword";
+    var isGifts = pfMethod === "gifts";
+    document.getElementById("pf-keyword-wrap").style.display = isKeyword ? "block" : "none";
+    document.getElementById("pf-channels-wrap").style.display = isKeyword ? "none" : "block";
+    document.getElementById("pf-posts-wrap").style.display = (isKeyword || isGifts) ? "none" : "block";
+    renderAccounts();
+  }
+
   function resetParsingScreen() {
     document.getElementById("parsing-form").style.display = "block";
     document.getElementById("parsing-progress").style.display = "none";
@@ -158,9 +243,9 @@
     document.getElementById("pd-results").innerHTML = "";
   }
 
-  function startJobAndShowProgress(channels, posts, minSubs, maxSubs, errEl, submitBtn) {
+  function startJobAndShowProgress(body, errEl, submitBtn) {
     submitBtn.disabled = true;
-    return post("/api/parsing/start", { channels: channels, posts: posts, min_subs: minSubs, max_subs: maxSubs })
+    return post("/api/parsing/start", body)
       .then(function (res) {
         submitBtn.disabled = false;
         showScreen("parsing");
@@ -181,16 +266,30 @@
     var errEl = document.getElementById("parsing-error");
     errEl.textContent = "";
 
-    var channelsRaw = document.getElementById("pf-channels").value;
-    var channels = channelsRaw.split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
-    var posts = parseInt(document.getElementById("pf-posts").value, 10);
+    var slots = Object.keys(pfSelectedSlots).map(Number);
+    if (!slots.length) { errEl.textContent = "Выбери хотя бы один аккаунт."; return; }
+
     var minSubs = parseInt(document.getElementById("pf-min").value, 10) || 0;
     var maxSubs = parseInt(document.getElementById("pf-max").value, 10) || 10000000;
+    var body = { method: pfMethod, slots: slots, min_subs: minSubs, max_subs: maxSubs };
 
-    if (!channels.length) { errEl.textContent = "Укажи хотя бы один канал."; return; }
-    if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
+    if (pfMethod === "keyword") {
+      var keyword = document.getElementById("pf-keyword").value.trim();
+      if (keyword.length < 2) { errEl.textContent = "Введи ключевую фразу (минимум 2 символа)."; return; }
+      body.keyword = keyword;
+    } else {
+      var channelsRaw = document.getElementById("pf-channels").value;
+      var channels = channelsRaw.split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
+      if (!channels.length) { errEl.textContent = "Укажи хотя бы один канал."; return; }
+      body.channels = channels;
+      if (pfMethod !== "gifts") {
+        var posts = parseInt(document.getElementById("pf-posts").value, 10);
+        if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
+        body.posts = posts;
+      }
+    }
 
-    startJobAndShowProgress(channels, posts, minSubs, maxSubs, errEl, document.getElementById("pf-submit"));
+    startJobAndShowProgress(body, errEl, document.getElementById("pf-submit"));
   });
 
   function pollJob(jobId) {
@@ -200,7 +299,8 @@
         var percent = job.percent || 0;
         document.getElementById("pp-fill").style.width = percent + "%";
         document.getElementById("pp-percent").textContent = percent + "%";
-        document.getElementById("pp-posts").textContent = "Пост " + (job.posts_done || 0) + " из " + (job.total_posts || 0);
+        document.getElementById("pp-posts").textContent =
+          (job.unit_label || "Пост") + " " + (job.posts_done || 0) + " из " + (job.total_posts || 0);
         document.getElementById("pp-found").textContent = "Найдено: " + (job.found || 0);
         document.getElementById("pp-label").textContent =
           job.status === "queued" ? "Встал в очередь…" :
@@ -509,7 +609,10 @@
     if (!channels.length) { errEl.textContent = "Выбери хотя бы один канал."; return; }
     if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
 
-    startJobAndShowProgress(channels, posts, minSubs, maxSubs, errEl, document.getElementById("rf-submit"));
+    startJobAndShowProgress(
+      { method: "comments", channels: channels, posts: posts, min_subs: minSubs, max_subs: maxSubs, slots: [] },
+      errEl, document.getElementById("rf-submit")
+    );
   });
 
   // ---------- Аккаунт / тарифы ----------

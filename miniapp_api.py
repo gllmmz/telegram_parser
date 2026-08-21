@@ -70,11 +70,17 @@ class ClearRequest(BaseModel):
     which: str  # 'parsed' | 'found'
 
 
+SEARCH_METHODS = {"comments", "gifts", "keyword", "deep"}
+
+
 class ParsingStartRequest(BaseModel):
-    channels: list[str]
-    posts: int
+    method: str = "comments"  # comments | gifts | keyword | deep
+    channels: list[str] = []
+    posts: int = 50
     min_subs: int = 0
     max_subs: int = 10_000_000
+    keyword: str = ""
+    slots: list[int] = []  # пустой список = все подключённые аккаунты
 
 
 class MarkContactedRequest(BaseModel):
@@ -109,6 +115,45 @@ def create_app(bot) -> FastAPI:
         ]
         for jid in stale:
             del active_jobs[jid]
+
+    async def _accounts_info(user_id: int) -> list[dict]:
+        """Подключённые личные аккаунты пользователя — для выбора, каким(-и)
+        парсить конкретный запуск. Аналог bot._connected_accounts_summary, но
+        отдаёт слот/имя/Premium отдельными полями для фронтенда, а не готовой строкой."""
+        out = []
+        for slot in botmod.user_used_slots(user_id):
+            if not await botmod.is_slot_connected(user_id, slot):
+                continue
+            async with botmod._user_clients_lock:
+                client = botmod._user_clients.get((user_id, slot))
+            label = f"Аккаунт №{slot}"
+            premium = False
+            if client is not None:
+                try:
+                    me = await client.get_me()
+                    name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+                    if name:
+                        label = name
+                    premium = bool(getattr(me, 'premium', False))
+                except Exception:
+                    pass
+            out.append({"slot": slot, "label": label, "premium": premium})
+        return out
+
+    async def _resolve_clients(user_id: int, slots: list[int]):
+        """Клиенты для конкретных слотов (выбор аккаунтов в мини-аппе); пустой
+        список слотов — все подключённые, как в боте по умолчанию."""
+        if not slots:
+            return await botmod.get_user_clients(user_id)
+        clients = []
+        for slot in dict.fromkeys(slots):  # без повторов, порядок сохраняем
+            if not await botmod.is_slot_connected(user_id, slot):
+                continue
+            async with botmod._user_clients_lock:
+                c = botmod._user_clients.get((user_id, slot))
+            if c is not None:
+                clients.append(c)
+        return clients
 
     @app.get("/api/me")
     async def api_me(user_id: int = Depends(get_current_user_id)):
@@ -157,6 +202,10 @@ def create_app(bot) -> FastAPI:
                 return {"ok": True}
         raise HTTPException(404, "Запись не найдена")
 
+    @app.get("/api/accounts")
+    async def api_accounts(user_id: int = Depends(get_current_user_id)):
+        return {"items": await _accounts_info(user_id)}
+
     @app.get("/api/tariffs")
     async def api_tariffs():
         return {
@@ -169,16 +218,26 @@ def create_app(bot) -> FastAPI:
 
     @app.post("/api/parsing/start")
     async def api_parsing_start(body: ParsingStartRequest, user_id: int = Depends(get_current_user_id)):
-        channels = list(dict.fromkeys(c.strip().lstrip('@') for c in body.channels if c.strip()))
-        if not channels:
-            raise HTTPException(400, "Не указаны каналы")
-        if len(channels) > MAX_CHANNELS_PER_JOB:
-            raise HTTPException(400, f"Слишком много каналов за раз (максимум {MAX_CHANNELS_PER_JOB})")
-        invalid = [c for c in channels if not CHANNEL_RE.match(c)]
-        if invalid:
-            raise HTTPException(400, f"Некорректный формат канала: {', '.join(invalid[:5])}")
-        if not (0 <= body.posts <= 400):
-            raise HTTPException(400, "Число постов должно быть от 0 до 400")
+        method = body.method if body.method in SEARCH_METHODS else "comments"
+        is_keyword = method == "keyword"
+        is_gifts = method == "gifts"
+
+        keyword = body.keyword.strip()
+        channels: list[str] = []
+        if is_keyword:
+            if len(keyword) < 2:
+                raise HTTPException(400, "Слишком короткая ключевая фраза (минимум 2 символа)")
+        else:
+            channels = list(dict.fromkeys(c.strip().lstrip('@') for c in body.channels if c.strip()))
+            if not channels:
+                raise HTTPException(400, "Не указаны каналы")
+            if len(channels) > MAX_CHANNELS_PER_JOB:
+                raise HTTPException(400, f"Слишком много каналов за раз (максимум {MAX_CHANNELS_PER_JOB})")
+            invalid = [c for c in channels if not CHANNEL_RE.match(c)]
+            if invalid:
+                raise HTTPException(400, f"Некорректный формат канала: {', '.join(invalid[:5])}")
+            if not is_gifts and not (0 <= body.posts <= 400):
+                raise HTTPException(400, "Число постов должно быть от 0 до 400")
 
         min_subs, max_subs = max(0, body.min_subs), max(0, body.max_subs)
         if min_subs > max_subs:
@@ -191,13 +250,35 @@ def create_app(bot) -> FastAPI:
             )
 
         # Подключение и управление личными аккаунтами — только в самом боте (кнопка
-        # "🔗 Привязанные аккаунты"), в мини-аппе для этого интерфейса нет.
+        # "🔗 Привязанные аккаунты"), в мини-аппе для этого интерфейса нет — здесь
+        # только выбор, какими из уже привязанных аккаунтов парсить.
         if not await botmod.is_user_account_connected(user_id):
             raise HTTPException(
                 403,
                 "Личный Telegram-аккаунт не подключён. Зайди в бота и нажми "
                 "«🔗 Привязанные аккаунты», чтобы подключить хотя бы один.",
             )
+
+        clients = await _resolve_clients(user_id, body.slots)
+        if not clients:
+            raise HTTPException(403, "Выбранные аккаунты сейчас недоступны — обнови список и попробуй ещё раз.")
+
+        if is_keyword:
+            premium_clients = []
+            for c in clients:
+                try:
+                    me = await c.get_me()
+                    if getattr(me, 'premium', False):
+                        premium_clients.append(c)
+                except Exception:
+                    pass
+            if not premium_clients:
+                raise HTTPException(
+                    400,
+                    "Ни у одного из выбранных аккаунтов нет Telegram Premium — без него "
+                    "этот способ почти не даёт результатов. Выбери другой аккаунт.",
+                )
+            clients = premium_clients
 
         # Проверка пробного периода и его старт должны быть атомарны относительно друг
         # друга — иначе несколько параллельных запросов от одного пользователя все
@@ -208,11 +289,19 @@ def create_app(bot) -> FastAPI:
             if not botmod.has_paid_access(user_id):
                 await botmod.ensure_trial_started(user_id)
 
+            if is_keyword:
+                total_posts = botmod.MAX_KEYWORD_RESULTS
+            elif is_gifts:
+                total_posts = botmod.MAX_GIFT_PARTICIPANTS * len(channels)
+            else:
+                total_posts = body.posts * len(channels)
+
             _cleanup_old_jobs()
             job_id = uuid.uuid4().hex
             active_jobs[job_id] = {
                 "user_id": user_id, "status": "queued", "percent": 0,
-                "posts_done": 0, "total_posts": body.posts * len(channels),
+                "posts_done": 0, "total_posts": total_posts,
+                "unit_label": "Участник" if is_gifts else "Пост",
                 "found": 0, "error": None, "results": [], "rejected": [],
                 "created_at": time.time(),
             }
@@ -226,11 +315,19 @@ def create_app(bot) -> FastAPI:
             try:
                 async with botmod.parse_semaphore:
                     active_jobs[job_id]["status"] = "running"
-                    outcome = await botmod.run_parsing_job(
-                        SimpleNamespace(bot=bot), user_id, user_id,
-                        channels, body.posts, min_subs, max_subs,
-                        notify_chat=False, on_progress=on_progress,
-                    )
+                    if is_keyword:
+                        outcome = await botmod.run_keyword_job(
+                            SimpleNamespace(bot=bot), user_id, user_id,
+                            keyword, min_subs, max_subs,
+                            clients=clients, notify_chat=False, on_progress=on_progress,
+                        )
+                    else:
+                        outcome = await botmod.run_parsing_job(
+                            SimpleNamespace(bot=bot), user_id, user_id,
+                            channels, body.posts, min_subs, max_subs,
+                            clients=clients, method=method,
+                            notify_chat=False, on_progress=on_progress,
+                        )
                 active_jobs[job_id]["status"] = "done"
                 active_jobs[job_id]["results"] = (outcome or {}).get("results", [])
                 active_jobs[job_id]["rejected"] = (outcome or {}).get("rejected", [])

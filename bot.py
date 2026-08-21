@@ -865,6 +865,7 @@ class ProgressTracker:
                 'found': found,
                 'elapsed': elapsed,
                 'eta_text': eta_text,
+                'unit_label': self.unit_label,
             })
         except Exception as e:
             print(f"⚠️ ProgressTracker._notify failed ({type(e).__name__}): {e}")

@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css?v=15">
+<link rel="stylesheet" href="/style.css?v=16">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
@@ -65,10 +65,22 @@
       <section class="screen" id="screen-parsing">
         <div id="parsing-form">
           <div class="field">
+            <label>Способ поиска</label>
+            <div id="pf-methods"></div>
+          </div>
+          <div class="field">
+            <label>Аккаунты для парсинга</label>
+            <div id="pf-accounts"></div>
+          </div>
+          <div class="field" id="pf-keyword-wrap" style="display:none">
+            <label>Ключевая фраза</label>
+            <input id="pf-keyword" type="text" placeholder="например, ищу дизайнера">
+          </div>
+          <div class="field" id="pf-channels-wrap">
             <label>Каналы</label>
             <textarea id="pf-channels" placeholder="https://t.me/channel1&#10;@channel2&#10;channel3"></textarea>
           </div>
-          <div class="field">
+          <div class="field" id="pf-posts-wrap">
             <label>Постов (0–400)</label>
             <input id="pf-posts" type="number" min="0" max="400" value="50">
           </div>
@@ -221,6 +233,6 @@
   </div>
 
 </div>
-<script src="/app.js?v=15"></script>
+<script src="/app.js?v=16"></script>
 </body>
 </html>
