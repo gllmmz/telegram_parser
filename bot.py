@@ -1781,19 +1781,41 @@ async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _update_code_message(context, chat_id)
         return CONNECT_CODE
 
-    if text not in "0123456789" or len(text) != 1:
-        # Игнорируем мусор, просто обновляем подсказку
+    if not text:
+        # Не текстовое сообщение (стикер, фото и т.п.) — игнорируем как мусор.
         await _update_code_message(context, chat_id)
         return CONNECT_CODE
 
-    if len(digits) >= code_length:
-        return CONNECT_CODE
+    if len(text) > 1:
+        # Пользователь прислал код целиком одним сообщением (естественное
+        # поведение — так работает штатный ввод кода в самом Telegram), а не
+        # нажимал цифры на клавиатуре по одной. Достаём цифры из текста —
+        # это же позволяет вставить код даже вместе с посторонними символами.
+        only_digits = re.sub(r'\D', '', text)
+        if len(only_digits) == code_length:
+            digits[:] = list(only_digits)
+            await _update_code_message(context, chat_id)
+        else:
+            await _update_code_message(
+                context, chat_id,
+                extra=f"\n\n⚠️ Не разобрал код — пришли ровно {code_length} цифр одним "
+                      "сообщением или набери их клавиатурой ниже.",
+            )
+            return CONNECT_CODE
+    else:
+        if text not in "0123456789":
+            # Игнорируем мусор, просто обновляем подсказку
+            await _update_code_message(context, chat_id)
+            return CONNECT_CODE
 
-    digits.append(text)
-    await _update_code_message(context, chat_id)
+        if len(digits) >= code_length:
+            return CONNECT_CODE
 
-    if len(digits) < code_length:
-        return CONNECT_CODE
+        digits.append(text)
+        await _update_code_message(context, chat_id)
+
+        if len(digits) < code_length:
+            return CONNECT_CODE
 
     # набрали нужное число цифр — пробуем войти
     code = "".join(digits)
