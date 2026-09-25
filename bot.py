@@ -5,6 +5,7 @@ import random
 import re
 import json
 import os
+import signal
 import time
 import traceback
 from datetime import datetime
@@ -81,6 +82,7 @@ COMMENT_CONCURRENCY = 10
 MAX_COMMENTS_PER_POST = 3000
 PROGRESS_EDIT_INTERVAL = 1.2
 MAX_CONCURRENT_PARSES = 8
+GRACEFUL_SHUTDOWN_TIMEOUT = 600  # сколько ждём завершения активных парсингов при рестарте/деплое (сек)
 CALL_TIMEOUT = 60
 MAX_FLOOD_WAIT = 120
 MAX_CHANNELS_PER_PARSE = 30  # тот же лимит, что и в мини-аппе (miniapp_api.MAX_CHANNELS_PER_JOB)
@@ -3861,7 +3863,40 @@ async def main():
     await app.updater.start_polling(drop_pending_updates=True)
     print("Бот успешно запущен!")
 
-    await asyncio.Event().wait()
+    # По умолчанию systemctl stop/restart шлёт SIGTERM, и без обработчика процесс
+    # (и вместе с ним asyncio.Event().wait() ниже) просто убивается на месте —
+    # вместе с любым парсингом, который в этот момент шёл. Пользователь при этом
+    # не получает вообще никакого сообщения, а прогресс "замирает" навсегда.
+    # Ловим сигнал и, если есть активные парсинги, ждём их завершения (до
+    # GRACEFUL_SHUTDOWN_TIMEOUT — иначе зависший сам по себе парсинг блокировал
+    # бы деплой навечно) прежде чем реально останавливаться.
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(sig_name: str):
+        print(f"⚠️ Получен {sig_name} — начинаю аккуратную остановку...")
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _request_shutdown, sig.name)
+
+    await shutdown_event.wait()
+
+    if active_parses > 0:
+        print(f"⏳ Активных парсингов: {active_parses} — жду завершения (до {GRACEFUL_SHUTDOWN_TIMEOUT}s)...")
+        waited = 0
+        while active_parses > 0 and waited < GRACEFUL_SHUTDOWN_TIMEOUT:
+            await asyncio.sleep(2)
+            waited += 2
+        if active_parses > 0:
+            print(f"⚠️ Не все парсинги завершились за {GRACEFUL_SHUTDOWN_TIMEOUT}s "
+                  f"({active_parses} ещё идут) — останавливаюсь принудительно.")
+        else:
+            print("✅ Активные парсинги завершены, останавливаюсь.")
+
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
 
 
 if __name__ == "__main__":
