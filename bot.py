@@ -3581,6 +3581,63 @@ async def revoke_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"У {display_name} (id={target_id}) и так не было доступа.")
 
 
+async def deduct_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deduct — в отличие от /grant (ставит абсолютный срок от сейчас) и /revoke
+    (снимает доступ целиком), отнимает N дней от ТЕКУЩЕГО остатка."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    args = context.args
+    if len(args) != 2 or not args[1].isdigit():
+        await update.effective_message.reply_text("Формат: /deduct <user_id или @username> <дней>")
+        return
+
+    target_id, display_name, err = await resolve_user(args[0])
+    if err:
+        await update.effective_message.reply_text(f"❌ {err}")
+        return
+
+    days = int(args[1])
+    if days <= 0:
+        await update.effective_message.reply_text("Число дней должно быть больше нуля.")
+        return
+
+    grant = access_grants.get(str(target_id))
+    if grant is None or time.time() >= grant['until']:
+        await update.effective_message.reply_text(f"У {display_name} (id={target_id}) и так нет активного доступа.")
+        return
+
+    new_until = grant['until'] - days * 86400
+
+    if new_until <= time.time():
+        del access_grants[str(target_id)]
+        await save_access_async(access_grants)
+        await update.effective_message.reply_text(
+            f"🚫 Списано {days} дн. — этого хватило, чтобы обнулить остаток. "
+            f"Доступ у {display_name} (id={target_id}) отозван."
+        )
+        try:
+            await context.bot.send_message(target_id, "⚠️ Твой доступ к парсингу был досрочно отозван.")
+        except Exception:
+            pass
+        return
+
+    grant['until'] = new_until
+    await save_access_async(access_grants)
+
+    until_str = fmt_date(new_until)
+    await update.effective_message.reply_text(
+        f"✅ Списано {days} дн. у {display_name} (id={target_id}). Остаток — до {until_str}."
+    )
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"⚠️ У твоего доступа к парсингу списано {days} дн. Теперь он действует до {until_str}."
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(f"(не смог уведомить пользователя лично: {e})")
+
+
 async def disconnect_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/disconnect отключает СРАЗУ ВСЕ привязанные аккаунты пользователя. Точечно —
     один конкретный — через «🔗 Привязанные аккаунты» в меню."""
@@ -3696,6 +3753,7 @@ async def main():
     app.add_handler(CommandHandler("support", support))
     app.add_handler(CommandHandler("grant", grant_access))
     app.add_handler(CommandHandler("revoke", revoke_access))
+    app.add_handler(CommandHandler("deduct", deduct_access))
     app.add_handler(CommandHandler("disconnect", disconnect_account))
     app.add_handler(MessageHandler(filters.Regex("^📁 Моя база каналов$"), my_database))
     app.add_handler(MessageHandler(filters.Regex("^👤 Аккаунт$"), account))
