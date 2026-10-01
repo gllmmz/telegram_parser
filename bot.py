@@ -1705,6 +1705,10 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # присылает её в sent.type.length. Если атрибута нет (редкие типы вроде
         # звонка-паттерна) — берём стандартные 5.
         code_length = getattr(sent.type, 'length', None) or 5
+        print(
+            f"📨 send_code_request для ...{phone[-4:]}: доставка "
+            f"{type(sent.type).__name__}, длина кода {code_length}"
+        )
         context.user_data['login_phone'] = phone
         context.user_data['login_phone_code_hash'] = sent.phone_code_hash
         context.user_data['login_client'] = client  # держим до sign_in
