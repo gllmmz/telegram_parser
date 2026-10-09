@@ -25,7 +25,7 @@ from telethon.errors import (
     FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError,
     MsgIdInvalidError, PhoneNumberInvalidError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError,
-    PeerFloodError, ChatAdminRequiredError,
+    PeerFloodError,
 )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
@@ -137,7 +137,6 @@ SEARCH_METHOD_BUTTONS = {
 }
 SEARCH_METHOD_LABELS = {v: k for k, v in SEARCH_METHOD_BUTTONS.items()}
 
-MAX_GIFT_PARTICIPANTS = 300  # сколько участников канала проверять на подарки за один прогон
 MAX_KEYWORD_RESULTS = 200  # сколько постов просматривать при глобальном поиске по фразе
 MAX_VIEWS_FILTER = 1_000_000_000  # верхняя граница фильтра просмотров, когда указан только минимум
 
@@ -902,7 +901,7 @@ class ProgressTracker:
         self.channels_total = channels_total
         self.account_label = f" [{account_label}]" if account_label else ""
         self.on_update = on_update
-        self.unit_label = unit_label  # "Пост"/"Участник" и т.п. — что именно считаем в прогрессе
+        self.unit_label = unit_label  # что именно считаем в прогрессе (сейчас везде "Пост")
         self.posts_done = 0
         self.channels_done = 0
         self.channel_found_counts = {}
@@ -1011,10 +1010,10 @@ async def parse_channel(
     channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
     also_check_gift_givers: bool = False, views_filter: "tuple[int, int] | None" = None,
 ):
-    """also_check_gift_givers включает "углублённый поиск" — для каждого автора
-    комментария дополнительно смотрим его видимых дарителей (кто подарил ему
-    подарок на профиль) и их био, как в find_via_gifts. Даёт больше кандидатов
-    ценой доп. запросов на каждого комментатора."""
+    """also_check_gift_givers включает способы "через подарки" и "углублённый поиск" —
+    для каждого автора комментария дополнительно смотрим его видимых дарителей (кто
+    подарил ему подарок на профиль) и их био. Даёт больше кандидатов ценой доп.
+    запросов на каждого комментатора."""
     results = []
     filtered_out = []
     total_comments = 0
@@ -1260,10 +1259,10 @@ async def _check_candidate_channels(
     user, client: TelegramClient, min_subs: int, max_subs: int,
     results: list, filtered_out: list, views_filter: "tuple[int, int] | None" = None,
 ) -> None:
-    """Общий кусок для find_via_gifts: смотрит био/каналы человека (участника или
-    дарителя) и раскладывает найденные каналы по results/filtered_out — тот же
-    формат записи, что и у parse_channel, чтобы дальше всё (база, рассылка,
-    мини-апп) работало одинаково независимо от способа поиска."""
+    """Смотрит био/каналы дарителя (из parse_channel с also_check_gift_givers) и
+    раскладывает найденные каналы по results/filtered_out — тот же формат записи,
+    что и у комментаторов, чтобы дальше всё (база, рассылка, мини-апп) работало
+    одинаково независимо от того, кого именно нашли."""
     if not isinstance(user, User) or user.bot or getattr(user, 'deleted', False):
         return
     bio, candidate_channels = await get_user_bio_and_channels(user, client)
@@ -1286,98 +1285,6 @@ async def _check_candidate_channels(
             results.append(_make_result(user, bio, ch_username, subs, views))
         else:
             filtered_out.append({'channel': ch_username, 'subscribers': subs})
-
-
-async def find_via_gifts(
-    channel_link: str, min_subs: int, max_subs: int,
-    *, client: TelegramClient, seen_users: set, tracker: "ProgressTracker",
-    channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
-    views_filter: "tuple[int, int] | None" = None,
-):
-    """Способ поиска "через подарки": идёт по участникам канала, смотрит их био
-    (как обычный парсинг), и ДОПОЛНИТЕЛЬНО — их видимых дарителей (кто подарил им
-    подарок на профиль, если отправитель не скрыт) — и тоже смотрит био дарителей.
-    Даритель часто не имеет отношения к каналу напрямую, зато может быть реальным
-    знакомым/партнёром участника — другой срез аудитории, чем комментаторы."""
-    results = []
-    filtered_out = []
-    saved_up_to = 0
-    checked_participants = 0
-    checked_gift_givers = 0
-
-    print(f"▶ find_via_gifts start: @{channel_link}")
-
-    try:
-        entity = await with_timeout(client.get_entity(channel_link), f"get_entity(@{channel_link})")
-    except Exception as e:
-        print(f"❌ @{channel_link}: не удалось открыть канал: {e}")
-        return [], [], f"❌ Не удалось открыть канал: {e}"
-
-    await tracker.channel_started(channel_link, channel_idx)
-
-    try:
-        async for participant in client.iter_participants(entity, limit=MAX_GIFT_PARTICIPANTS):
-            checked_participants += 1
-
-            if participant.id not in seen_users:
-                seen_users.add(participant.id)
-                try:
-                    await _check_candidate_channels(
-                        participant, client, min_subs, max_subs, results, filtered_out, views_filter
-                    )
-                except Exception as e:
-                    print(f"⚠️ find_via_gifts(@{channel_link}) участник {participant.id}: {type(e).__name__}: {e}")
-
-            # Видимые дарители этого участника
-            try:
-                gifts = await with_timeout(
-                    client(GetSavedStarGiftsRequest(peer=participant, offset="", limit=100)),
-                    f"GetSavedStarGifts({participant.id})",
-                )
-            except Exception as e:
-                gifts = None
-                print(f"⚠️ GetSavedStarGifts({participant.id}) на @{channel_link}: {type(e).__name__}: {e}")
-
-            if gifts is not None:
-                gift_users = {u.id: u for u in gifts.users}
-                for g in gifts.gifts:
-                    if g.name_hidden or g.from_id is None:
-                        continue
-                    giver_id = getattr(g.from_id, 'user_id', None)
-                    if giver_id is None or giver_id not in gift_users or giver_id in seen_users:
-                        continue
-                    seen_users.add(giver_id)
-                    checked_gift_givers += 1
-                    try:
-                        await _check_candidate_channels(
-                            gift_users[giver_id], client, min_subs, max_subs, results, filtered_out,
-                            views_filter,
-                        )
-                    except Exception as e:
-                        print(f"⚠️ find_via_gifts(@{channel_link}) даритель {giver_id}: {type(e).__name__}: {e}")
-
-            await tracker.post_done(channel_link, channel_idx, MAX_GIFT_PARTICIPANTS, len(results))
-
-            if on_new_results is not None and len(results) > saved_up_to:
-                await on_new_results(results[saved_up_to:])
-                saved_up_to = len(results)
-    except (ChatAdminRequiredError, ChannelPrivateError) as e:
-        # Список участников у публичных каналов обычно виден только админам —
-        # это ограничение самого Telegram, не временный сбой. Если сорвалось на
-        # первом же участнике (checked_participants <= 1), значит список закрыт
-        # целиком, и дальше пробовать нет смысла — явно говорим пользователю, а не
-        # молча возвращаем 0 результатов, будто просто никого не нашли.
-        if checked_participants <= 1:
-            print(f"❌ find_via_gifts(@{channel_link}): список участников недоступен ({type(e).__name__})")
-            return [], [], "❌ Список участников канала недоступен (нужны права администратора этого канала)"
-        print(f"⚠️ find_via_gifts(@{channel_link}) прервано на {checked_participants}-м участнике: {type(e).__name__}: {e}")
-    except Exception as e:
-        print(f"⚠️ find_via_gifts(@{channel_link}) прервано: {type(e).__name__}: {e}")
-
-    info = (f"Участников проверено: {checked_participants} | "
-            f"Дарителей проверено: {checked_gift_givers} | "
-            f"Подошло: {len(results)}")
-    return results, filtered_out, info
 
 
 async def _resolve_channel_owner(chat, client: TelegramClient):
@@ -2144,8 +2051,9 @@ async def new_parsing(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Каким способом искать?\n\n"
         "💬 <b>Через комментарии</b> — авторы комментариев к постам канала, их био "
         "и личные публичные каналы.\n\n"
-        "🎁 <b>Через подарки</b> — участники канала и их видимые дарители (кто "
-        "подарил им подарок на профиль), их био и каналы.\n\n"
+        "🎁 <b>Через подарки</b> — аккаунты заходят в канал, берут авторов комментариев, "
+        "смотрят в их подарках видимых дарителей и достают био и каналы и у "
+        "комментаторов, и у дарителей.\n\n"
         "🔑 <b>По ключевой фразе</b> — совпадения во всех публичных постах Telegram "
         "(нужен Premium хотя бы на одном из выбранных аккаунтов).\n\n"
         "🧬 <b>Углублённый поиск</b> — авторы комментариев, их каналы, "
@@ -3021,20 +2929,6 @@ async def get_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHANNELS
 
     context.user_data['channels'] = links
-    method = context.user_data.get('search_method', SEARCH_METHOD_COMMENTS)
-
-    if method == SEARCH_METHOD_GIFTS:
-        # "Через подарки" смотрит участников канала, число постов тут не при чём —
-        # сразу к диапазону подписчиков.
-        await parsing_step_reply(
-            update, context,
-            f"Каналы: {', '.join('@'+c for c in context.user_data['channels'])}\n\n"
-            "Укажи диапазон подписчиков.\n\n"
-            "Примеры:\n<code>1000-10000</code>\n<code>5000</code> (от 5000 и выше)\n<code>0-5000</code>",
-            parse_mode="HTML",
-            reply_markup=cancel_keyboard(),
-        )
-        return SUBS_RANGE
 
     await parsing_step_reply(
         update, context,
@@ -3140,7 +3034,7 @@ async def get_views_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     min_subs = context.user_data.pop('min_subs', 0)
     max_subs = context.user_data.pop('max_subs', 10_000_000)
-    posts = context.user_data.get('posts')  # None для "подарки"/"фраза" — там не нужно
+    posts = context.user_data.get('posts')  # None для "фраза" — там нет постов канала
     channels = context.user_data.get('channels')  # None для "фраза" — там нет каналов
     keyword = context.user_data.get('keyword')  # только для "фраза"
     method = context.user_data.pop('search_method', SEARCH_METHOD_COMMENTS)
@@ -3236,10 +3130,7 @@ async def run_parsing_job(
 
             trial_line = f"\n{trial_note}" if trial_note else ""
             accounts_line = f" · аккаунтов: {len(clients)}" if len(clients) > 1 else ""
-            posts_line = (
-                f"📄 Постов: <b>{posts}</b>\n"
-                if method in (SEARCH_METHOD_COMMENTS, SEARCH_METHOD_DEEP) else ""
-            )
+            posts_line = f"📄 Постов: <b>{posts}</b>\n"
             method_line = (
                 f"🔎 Способ: <b>{html.escape(SEARCH_METHOD_LABELS.get(method, method))}</b>\n"
                 if method != SEARCH_METHOD_COMMENTS else ""
@@ -3261,12 +3152,10 @@ async def run_parsing_job(
         debug_info: list[str | None] = [None] * len(channels)
 
         seen_users = set()
-        per_channel_unit = MAX_GIFT_PARTICIPANTS if method == SEARCH_METHOD_GIFTS else (posts or 1)
         tracker = ProgressTracker(
-            status_msg, total_posts=per_channel_unit * len(channels), channels_total=len(channels),
+            status_msg, total_posts=(posts or 1) * len(channels), channels_total=len(channels),
             account_label="личный" if len(clients) == 1 else f"{len(clients)} акк.",
             on_update=on_progress,
-            unit_label="Участник" if method == SEARCH_METHOD_GIFTS else "Пост",
         )
 
         user_id_str = str(user_id)
@@ -3298,37 +3187,22 @@ async def run_parsing_job(
                     idx, ch = channel_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                if method == SEARCH_METHOD_COMMENTS:
-                    channel_timeout = max(300, posts * 30)
-                elif method == SEARCH_METHOD_DEEP:
-                    # Углублённый поиск делает доп. запросы (подарки) на каждого
-                    # комментатора — даём заметно больше времени на канал.
-                    channel_timeout = max(600, posts * 60)
-                else:
-                    channel_timeout = 900
+                # "Через подарки" и "углублённый поиск" делают доп. запросы (подарки) на
+                # каждого комментатора — даём заметно больше времени на канал.
+                with_gifts = method in (SEARCH_METHOD_GIFTS, SEARCH_METHOD_DEEP)
+                channel_timeout = max(600, posts * 60) if with_gifts else max(300, posts * 30)
                 try:
-                    if method == SEARCH_METHOD_GIFTS:
-                        results, filtered_out, info = await asyncio.wait_for(
-                            find_via_gifts(
-                                ch, min_subs, max_subs,
-                                client=worker_client, seen_users=seen_users, tracker=tracker,
-                                channel_idx=idx, channels_total=len(channels),
-                                on_new_results=on_new_results, views_filter=views_filter,
-                            ),
-                            timeout=channel_timeout,
-                        )
-                    else:
-                        results, filtered_out, info = await asyncio.wait_for(
-                            parse_channel(
-                                ch, posts, min_subs, max_subs,
-                                client=worker_client, seen_users=seen_users, tracker=tracker,
-                                channel_idx=idx, channels_total=len(channels),
-                                on_new_results=on_new_results,
-                                also_check_gift_givers=(method == SEARCH_METHOD_DEEP),
-                                views_filter=views_filter,
-                            ),
-                            timeout=channel_timeout,
-                        )
+                    results, filtered_out, info = await asyncio.wait_for(
+                        parse_channel(
+                            ch, posts, min_subs, max_subs,
+                            client=worker_client, seen_users=seen_users, tracker=tracker,
+                            channel_idx=idx, channels_total=len(channels),
+                            on_new_results=on_new_results,
+                            also_check_gift_givers=with_gifts,
+                            views_filter=views_filter,
+                        ),
+                        timeout=channel_timeout,
+                    )
                 except asyncio.TimeoutError:
                     print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
                     results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"

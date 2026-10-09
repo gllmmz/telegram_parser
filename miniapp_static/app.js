@@ -156,7 +156,7 @@
     { id: "comments", icon: "💬", title: "Через комментарии",
       desc: "Авторы комментариев к постам канала, их био и личные публичные каналы." },
     { id: "gifts", icon: "🎁", title: "Через подарки",
-      desc: "Участники канала и их видимые дарители (кто подарил им подарок на профиль), их био и каналы." },
+      desc: "Аккаунты заходят в канал, берут авторов комментариев, смотрят в их подарках видимых дарителей и достают био и каналы и у комментаторов, и у дарителей." },
     { id: "keyword", icon: "🔑", title: "По ключевой фразе",
       desc: "Совпадения во всех публичных постах Telegram. Нужен Premium хотя бы на одном из выбранных аккаунтов." },
     { id: "deep", icon: "🧬", title: "Углублённый поиск",
@@ -229,10 +229,9 @@
 
   function updateFormVisibility() {
     var isKeyword = pfMethod === "keyword";
-    var isGifts = pfMethod === "gifts";
     document.getElementById("pf-keyword-wrap").style.display = isKeyword ? "block" : "none";
     document.getElementById("pf-channels-wrap").style.display = isKeyword ? "none" : "block";
-    document.getElementById("pf-posts-wrap").style.display = (isKeyword || isGifts) ? "none" : "block";
+    document.getElementById("pf-posts-wrap").style.display = isKeyword ? "none" : "block";
     renderAccounts();
   }
 
@@ -296,11 +295,9 @@
       var channels = channelsRaw.split(/[\s,]+/).map(function (s) { return s.trim(); }).filter(Boolean);
       if (!channels.length) { errEl.textContent = "Укажи хотя бы один канал."; return; }
       body.channels = channels;
-      if (pfMethod !== "gifts") {
-        var posts = parseInt(document.getElementById("pf-posts").value, 10);
-        if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
-        body.posts = posts;
-      }
+      var posts = parseInt(document.getElementById("pf-posts").value, 10);
+      if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
+      body.posts = posts;
     }
 
     startJobAndShowProgress(body, errEl, document.getElementById("pf-submit"));

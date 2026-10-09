@@ -223,7 +223,6 @@ def create_app(bot) -> FastAPI:
     async def api_parsing_start(body: ParsingStartRequest, user_id: int = Depends(get_current_user_id)):
         method = body.method if body.method in SEARCH_METHODS else "comments"
         is_keyword = method == "keyword"
-        is_gifts = method == "gifts"
 
         keyword = body.keyword.strip()
         channels: list[str] = []
@@ -239,7 +238,7 @@ def create_app(bot) -> FastAPI:
             invalid = [c for c in channels if not CHANNEL_RE.match(c)]
             if invalid:
                 raise HTTPException(400, f"Некорректный формат канала: {', '.join(invalid[:5])}")
-            if not is_gifts and not (0 <= body.posts <= 400):
+            if not (0 <= body.posts <= 400):
                 raise HTTPException(400, "Число постов должно быть от 0 до 400")
 
         min_subs, max_subs = max(0, body.min_subs), max(0, body.max_subs)
@@ -300,8 +299,6 @@ def create_app(bot) -> FastAPI:
 
             if is_keyword:
                 total_posts = botmod.MAX_KEYWORD_RESULTS
-            elif is_gifts:
-                total_posts = botmod.MAX_GIFT_PARTICIPANTS * len(channels)
             else:
                 total_posts = body.posts * len(channels)
 
@@ -310,7 +307,7 @@ def create_app(bot) -> FastAPI:
             active_jobs[job_id] = {
                 "user_id": user_id, "status": "queued", "percent": 0,
                 "posts_done": 0, "total_posts": total_posts,
-                "unit_label": "Участник" if is_gifts else "Пост",
+                "unit_label": "Пост",
                 "found": 0, "error": None, "results": [], "rejected": [],
                 "created_at": time.time(),
             }
