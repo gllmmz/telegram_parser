@@ -81,6 +81,9 @@ class ParsingStartRequest(BaseModel):
     max_subs: int = 10_000_000
     keyword: str = ""
     slots: list[int] = []  # пустой список = все подключённые аккаунты
+    # Просмотры последнего поста канала; оба None = фильтр выключен.
+    min_views: int | None = None
+    max_views: int | None = None
 
 
 class MarkContactedRequest(BaseModel):
@@ -243,6 +246,12 @@ def create_app(bot) -> FastAPI:
         if min_subs > max_subs:
             min_subs, max_subs = max_subs, min_subs
 
+        views_filter = None
+        if body.min_views is not None or body.max_views is not None:
+            lo = max(0, body.min_views or 0)
+            hi = max(0, body.max_views) if body.max_views is not None else botmod.MAX_VIEWS_FILTER
+            views_filter = (min(lo, hi), max(lo, hi))
+
         if not await botmod.is_subscribed(user_id, SimpleNamespace(bot=bot)):
             raise HTTPException(
                 403,
@@ -320,6 +329,7 @@ def create_app(bot) -> FastAPI:
                             SimpleNamespace(bot=bot), user_id, user_id,
                             keyword, min_subs, max_subs,
                             clients=clients, notify_chat=False, on_progress=on_progress,
+                            views_filter=views_filter,
                         )
                     else:
                         outcome = await botmod.run_parsing_job(
@@ -327,6 +337,7 @@ def create_app(bot) -> FastAPI:
                             channels, body.posts, min_subs, max_subs,
                             clients=clients, method=method,
                             notify_chat=False, on_progress=on_progress,
+                            views_filter=views_filter,
                         )
                 active_jobs[job_id]["status"] = "done"
                 active_jobs[job_id]["results"] = (outcome or {}).get("results", [])

@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/style.css?v=16">
+<link rel="stylesheet" href="/style.css?v=17">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
@@ -57,6 +57,16 @@
             <input id="rf-max" type="number" min="0" value="10000000">
           </div>
         </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Просмотров поста от</label>
+            <input id="rf-vmin" type="number" min="0" placeholder="любые">
+          </div>
+          <div class="field">
+            <label>Просмотров поста до</label>
+            <input id="rf-vmax" type="number" min="0" placeholder="любые">
+          </div>
+        </div>
         <div id="reparse-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
         <button class="btn btn-primary" id="rf-submit">Запустить парсинг</button>
       </section>
@@ -92,6 +102,16 @@
             <div class="field">
               <label>Подписчиков до</label>
               <input id="pf-max" type="number" min="0" value="10000000">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label>Просмотров поста от</label>
+              <input id="pf-vmin" type="number" min="0" placeholder="любые">
+            </div>
+            <div class="field">
+              <label>Просмотров поста до</label>
+              <input id="pf-vmax" type="number" min="0" placeholder="любые">
             </div>
           </div>
           <div id="parsing-error" style="color:var(--error);font-size:12px;margin-bottom:8px"></div>
@@ -233,6 +253,6 @@
   </div>
 
 </div>
-<script src="/app.js?v=16"></script>
+<script src="/app.js?v=17"></script>
 </body>
 </html>

@@ -88,7 +88,8 @@
         ' title="Отметить как написано">' + (contacted ? '✓' : '') + '</div>' +
       '<div class="found-item-body">' +
         '<div class="title">' + esc(name) + ' <span class="meta">(' + personLink + ')</span></div>' +
-        '<div class="meta">канал: ' + channelLink + ' — ' + esc(it.subscribers) + ' подп.</div>' +
+        '<div class="meta">канал: ' + channelLink + ' — ' + esc(it.subscribers) + ' подп.' +
+          (it.last_post_views != null ? ' · 👁 ' + esc(it.last_post_views) : '') + '</div>' +
         (foundWhen ? '<div class="meta">найден: ' + esc(foundWhen) + '</div>' : '') +
       '</div>' +
       '</div>';
@@ -235,6 +236,16 @@
     renderAccounts();
   }
 
+  // Пустые поля = фильтр по просмотрам последнего поста выключен (в запрос не попадает).
+  function readViewsFilter(minId, maxId) {
+    var out = {};
+    var vmin = parseInt(document.getElementById(minId).value, 10);
+    var vmax = parseInt(document.getElementById(maxId).value, 10);
+    if (!isNaN(vmin)) out.min_views = vmin;
+    if (!isNaN(vmax)) out.max_views = vmax;
+    return out;
+  }
+
   function resetParsingScreen() {
     document.getElementById("parsing-form").style.display = "block";
     document.getElementById("parsing-progress").style.display = "none";
@@ -271,7 +282,10 @@
 
     var minSubs = parseInt(document.getElementById("pf-min").value, 10) || 0;
     var maxSubs = parseInt(document.getElementById("pf-max").value, 10) || 10000000;
-    var body = { method: pfMethod, slots: slots, min_subs: minSubs, max_subs: maxSubs };
+    var body = Object.assign(
+      { method: pfMethod, slots: slots, min_subs: minSubs, max_subs: maxSubs },
+      readViewsFilter("pf-vmin", "pf-vmax")
+    );
 
     if (pfMethod === "keyword") {
       var keyword = document.getElementById("pf-keyword").value.trim();
@@ -610,7 +624,10 @@
     if (isNaN(posts) || posts < 0 || posts > 400) { errEl.textContent = "Число постов должно быть от 0 до 400."; return; }
 
     startJobAndShowProgress(
-      { method: "comments", channels: channels, posts: posts, min_subs: minSubs, max_subs: maxSubs, slots: [] },
+      Object.assign(
+        { method: "comments", channels: channels, posts: posts, min_subs: minSubs, max_subs: maxSubs, slots: [] },
+        readViewsFilter("rf-vmin", "rf-vmax")
+      ),
       errEl, document.getElementById("rf-submit")
     );
   });

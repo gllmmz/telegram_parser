@@ -121,6 +121,7 @@ BROADCAST_SELECT, BROADCAST_TEXT, BROADCAST_CONFIRM = range(6, 9)
 REPARSE_SELECT = 9
 ACCOUNTS_DISCONNECT_SELECT = 10
 METHOD_SELECT, PARSE_ACCOUNT_SELECT, KEYWORD_INPUT = range(11, 14)
+VIEWS_RANGE = 14
 
 # ---- Способы поиска ----
 SEARCH_METHOD_COMMENTS = 'comments'
@@ -138,6 +139,7 @@ SEARCH_METHOD_LABELS = {v: k for k, v in SEARCH_METHOD_BUTTONS.items()}
 
 MAX_GIFT_PARTICIPANTS = 300  # сколько участников канала проверять на подарки за один прогон
 MAX_KEYWORD_RESULTS = 200  # сколько постов просматривать при глобальном поиске по фразе
+MAX_VIEWS_FILTER = 1_000_000_000  # верхняя граница фильтра просмотров, когда указан только минимум
 
 telethon_clients = [
     TelegramClient(name, API_ID, API_HASH, connection_retries=10, retry_delay=3)
@@ -707,6 +709,76 @@ async def get_channel_subscribers(username: str, client: TelegramClient) -> int 
     return None
 
 
+# Просмотры последнего поста — только в памяти (не в файле, как подписчики): последний
+# пост меняется быстро, долгая персистентность тут только вредила бы.
+channel_views_cache: dict[str, dict] = {}
+CHANNEL_VIEWS_TTL_SECONDS = 6 * 3600
+
+
+async def get_last_post_views(username: str, client: TelegramClient) -> int | None:
+    """Просмотры последнего поста канала: из последних 5 сообщений берём первое с
+    просмотрами (у сервисных сообщений их нет). None — не удалось узнать или постов нет."""
+    cached = channel_views_cache.get(username)
+    if cached is not None and (time.time() - cached['ts']) < CHANNEL_VIEWS_TTL_SECONDS:
+        return cached['views']
+    flood_until = client_subs_flood_until.get(id(client))
+    if flood_until and time.time() < flood_until:
+        return None
+    try:
+        msgs = await with_timeout(client.get_messages(username, limit=5), f"get_messages({username})")
+    except (UsernameNotOccupiedError, ChannelPrivateError, ValueError, TypeError):
+        return None
+    except FloodWaitError as e:
+        if e.seconds > MAX_FLOOD_WAIT:
+            client_subs_flood_until[id(client)] = time.time() + e.seconds
+        if await sleep_flood_wait(e.seconds, f"get_last_post_views({username})"):
+            return await get_last_post_views(username, client)
+        return None
+    except Exception as e:
+        print(f"⚠️ get_last_post_views({username}) на {client_pool.label_for(client)}: {type(e).__name__}: {e}")
+        client_broken_until[id(client)] = time.time() + CLIENT_BROKEN_COOLDOWN
+        return None
+    views = next((m.views for m in msgs if getattr(m, 'views', None) is not None), None)
+    channel_views_cache[username] = {'views': views, 'ts': time.time()}
+    return views
+
+
+async def check_last_post_views(
+    username: str, client: TelegramClient, views_filter: "tuple[int, int] | None",
+) -> tuple[bool, int | None]:
+    """(проходит ли канал фильтр по просмотрам последнего поста, сами просмотры).
+    views_filter=None — фильтр выключен: канал проходит и лишних запросов не делаем."""
+    if views_filter is None:
+        return True, None
+    views = await get_last_post_views(username, client)
+    if views is None:
+        return False, None
+    lo, hi = views_filter
+    return lo <= views <= hi, views
+
+
+def _make_result(user, bio: str, channel: str, subs: int, views: int | None) -> dict:
+    record = {
+        'user_id': user.id,
+        'username': user.username,
+        'first_name': user.first_name or "",
+        'last_name': user.last_name or "",
+        'bio': bio[:300],
+        'channel': channel,
+        'subscribers': subs,
+    }
+    if views is not None:
+        record['last_post_views'] = views
+    return record
+
+
+def _views_status_line(views_filter: "tuple[int, int] | None") -> str:
+    if views_filter is None:
+        return ""
+    lo, hi = views_filter
+    return f"👁 Просмотры последнего поста: <b>{lo:,} – {hi:,}</b>\n"
+
+
 async def get_entity_with_retry(entity_ref, client: TelegramClient):
     try:
         return await with_timeout(client.get_entity(entity_ref), f"get_entity({entity_ref})")
@@ -937,7 +1009,7 @@ async def parse_channel(
     channel_link: str, posts_limit: int, min_subs: int, max_subs: int,
     *, client: TelegramClient, seen_users: set, tracker: "ProgressTracker",
     channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
-    also_check_gift_givers: bool = False,
+    also_check_gift_givers: bool = False, views_filter: "tuple[int, int] | None" = None,
 ):
     """also_check_gift_givers включает "углублённый поиск" — для каждого автора
     комментария дополнительно смотрим его видимых дарителей (кто подарил ему
@@ -1068,16 +1140,12 @@ async def parse_channel(
                     if subs is None:
                         continue
 
-                    if min_subs <= subs <= max_subs:
-                        results.append({
-                            'user_id': user.id,
-                            'username': user.username,
-                            'first_name': user.first_name or "",
-                            'last_name': user.last_name or "",
-                            'bio': bio[:300],
-                            'channel': ch_username,
-                            'subscribers': subs,
-                        })
+                    views_ok, views = (
+                        await check_last_post_views(ch_username, client, views_filter)
+                        if min_subs <= subs <= max_subs else (False, None)
+                    )
+                    if views_ok:
+                        results.append(_make_result(user, bio, ch_username, subs, views))
                     else:
                         filtered_out.append({'channel': ch_username, 'subscribers': subs})
 
@@ -1105,7 +1173,8 @@ async def parse_channel(
                         gift_givers_checked += 1
                         try:
                             await _check_candidate_channels(
-                                gift_users[giver_id], client, min_subs, max_subs, results, filtered_out
+                                gift_users[giver_id], client, min_subs, max_subs, results, filtered_out,
+                                views_filter,
                             )
                         except Exception as e:
                             print(f"⚠️ deep-search даритель {giver_id}: {type(e).__name__}: {e}")
@@ -1189,7 +1258,7 @@ async def parse_channel(
 
 async def _check_candidate_channels(
     user, client: TelegramClient, min_subs: int, max_subs: int,
-    results: list, filtered_out: list,
+    results: list, filtered_out: list, views_filter: "tuple[int, int] | None" = None,
 ) -> None:
     """Общий кусок для find_via_gifts: смотрит био/каналы человека (участника или
     дарителя) и раскладывает найденные каналы по results/filtered_out — тот же
@@ -1209,16 +1278,12 @@ async def _check_candidate_channels(
             channel_subs_cache[ch_username] = {'subs': subs, 'ts': time.time()}
         if subs is None:
             continue
-        if min_subs <= subs <= max_subs:
-            results.append({
-                'user_id': user.id,
-                'username': user.username,
-                'first_name': user.first_name or "",
-                'last_name': user.last_name or "",
-                'bio': bio[:300],
-                'channel': ch_username,
-                'subscribers': subs,
-            })
+        views_ok, views = (
+            await check_last_post_views(ch_username, client, views_filter)
+            if min_subs <= subs <= max_subs else (False, None)
+        )
+        if views_ok:
+            results.append(_make_result(user, bio, ch_username, subs, views))
         else:
             filtered_out.append({'channel': ch_username, 'subscribers': subs})
 
@@ -1227,6 +1292,7 @@ async def find_via_gifts(
     channel_link: str, min_subs: int, max_subs: int,
     *, client: TelegramClient, seen_users: set, tracker: "ProgressTracker",
     channel_idx: int, channels_total: int, on_new_results: "callable | None" = None,
+    views_filter: "tuple[int, int] | None" = None,
 ):
     """Способ поиска "через подарки": идёт по участникам канала, смотрит их био
     (как обычный парсинг), и ДОПОЛНИТЕЛЬНО — их видимых дарителей (кто подарил им
@@ -1256,7 +1322,9 @@ async def find_via_gifts(
             if participant.id not in seen_users:
                 seen_users.add(participant.id)
                 try:
-                    await _check_candidate_channels(participant, client, min_subs, max_subs, results, filtered_out)
+                    await _check_candidate_channels(
+                        participant, client, min_subs, max_subs, results, filtered_out, views_filter
+                    )
                 except Exception as e:
                     print(f"⚠️ find_via_gifts(@{channel_link}) участник {participant.id}: {type(e).__name__}: {e}")
 
@@ -1282,7 +1350,8 @@ async def find_via_gifts(
                     checked_gift_givers += 1
                     try:
                         await _check_candidate_channels(
-                            gift_users[giver_id], client, min_subs, max_subs, results, filtered_out
+                            gift_users[giver_id], client, min_subs, max_subs, results, filtered_out,
+                            views_filter,
                         )
                     except Exception as e:
                         print(f"⚠️ find_via_gifts(@{channel_link}) даритель {giver_id}: {type(e).__name__}: {e}")
@@ -1337,7 +1406,7 @@ async def _resolve_channel_owner(chat, client: TelegramClient):
 async def find_via_keyword(
     keyword: str, min_subs: int, max_subs: int,
     *, client: TelegramClient, seen_channels: set, tracker: "ProgressTracker",
-    on_new_results: "callable | None" = None,
+    on_new_results: "callable | None" = None, views_filter: "tuple[int, int] | None" = None,
 ):
     """Способ поиска "по ключевой фразе": глобальный поиск по всем публичным постам
     (SearchGlobalRequest) — находит КАНАЛЫ напрямую по совпадению в тексте поста,
@@ -1407,22 +1476,18 @@ async def find_via_keyword(
                 if subs is None:
                     continue
 
-                if min_subs <= subs <= max_subs:
+                views_ok, views = (
+                    await check_last_post_views(username, client, views_filter)
+                    if min_subs <= subs <= max_subs else (False, None)
+                )
+                if views_ok:
                     # У найденного через фразу канала нет "человека" сам по себе —
                     # резолвим создателя канала, чтобы запись была настоящим рабочим
                     # контактом (можно писать/добавить в рассылку), а не заглушкой.
                     owner = await _resolve_channel_owner(chat, client)
                     if owner is None:
                         continue
-                    results.append({
-                        'user_id': owner.id,
-                        'username': owner.username,
-                        'first_name': owner.first_name or "",
-                        'last_name': owner.last_name or "",
-                        'bio': f"Владелец канала @{username}",
-                        'channel': username,
-                        'subscribers': subs,
-                    })
+                    results.append(_make_result(owner, f"Владелец канала @{username}", username, subs, views))
                 else:
                     filtered_out.append({'channel': username, 'subscribers': subs})
 
@@ -1483,6 +1548,13 @@ def linked_accounts_keyboard(can_add: bool, has_any: bool):
 def search_method_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton(label)] for label in SEARCH_METHOD_BUTTONS] + [[KeyboardButton("❌ Отмена")]],
+        resize_keyboard=True,
+    )
+
+
+def views_range_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("⏭ Без фильтра")], [KeyboardButton("❌ Отмена")]],
         resize_keyboard=True,
     )
 
@@ -2029,7 +2101,7 @@ def _reset_parsing_flow_state(context: ContextTypes.DEFAULT_TYPE):
     найденным"), потому что промежуточные хендлеры чистят их не на всех путях."""
     for key in (
         'search_method', 'selected_clients', 'selected_slots',
-        'channels', 'keyword', 'posts', 'parse_account_slots',
+        'channels', 'keyword', 'posts', 'parse_account_slots', 'min_subs', 'max_subs',
     ):
         context.user_data.pop(key, None)
 
@@ -3025,6 +3097,49 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if min_subs > max_subs:
         min_subs, max_subs = max_subs, min_subs
 
+    context.user_data['min_subs'] = min_subs
+    context.user_data['max_subs'] = max_subs
+    await parsing_step_reply(
+        update, context,
+        "Укажи диапазон <b>просмотров на последнем посту</b> канала — так отсеются "
+        "«мёртвые» каналы.\n\n"
+        "Примеры:\n"
+        "<code>1000-50000</code>\n"
+        "<code>500</code> (от 500 и выше)\n\n"
+        "Или нажми «⏭ Без фильтра».",
+        parse_mode="HTML",
+        reply_markup=views_range_keyboard(),
+    )
+    return VIEWS_RANGE
+
+
+async def get_views_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    if text == "❌ Отмена":
+        await parsing_step_reply(update, context, "Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    views_filter = None
+    if text != "⏭ Без фильтра":
+        if "-" in text:
+            parts = text.replace(" ", "").split("-")
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                views_filter = (int(parts[0]), int(parts[1]))
+        elif text.isdigit():
+            views_filter = (int(text), MAX_VIEWS_FILTER)
+        if views_filter is None:
+            await parsing_step_reply(
+                update, context,
+                "Неправильный формат. Пример: 1000-50000 или 500 — либо нажми «⏭ Без фильтра».",
+                reply_markup=views_range_keyboard(),
+            )
+            return VIEWS_RANGE
+        if views_filter[0] > views_filter[1]:
+            views_filter = (views_filter[1], views_filter[0])
+
+    min_subs = context.user_data.pop('min_subs', 0)
+    max_subs = context.user_data.pop('max_subs', 10_000_000)
     posts = context.user_data.get('posts')  # None для "подарки"/"фраза" — там не нужно
     channels = context.user_data.get('channels')  # None для "фраза" — там нет каналов
     keyword = context.user_data.get('keyword')  # только для "фраза"
@@ -3078,12 +3193,12 @@ async def get_subs_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if method == SEARCH_METHOD_KEYWORD:
             await run_keyword_job(
                 context, chat_id, user_id, keyword, min_subs, max_subs, trial_note,
-                clients=clients,
+                clients=clients, views_filter=views_filter,
             )
         else:
             await run_parsing_job(
                 context, chat_id, user_id, channels, posts, min_subs, max_subs, trial_note,
-                clients=clients, method=method,
+                clients=clients, method=method, views_filter=views_filter,
             )
 
     return ConversationHandler.END
@@ -3095,6 +3210,7 @@ async def run_parsing_job(
     trial_note: str | None = None,
     *, clients: list[TelegramClient] | None = None, method: str = SEARCH_METHOD_COMMENTS,
     notify_chat: bool = True, on_progress: "callable | None" = None,
+    views_filter: "tuple[int, int] | None" = None,
 ):
     global active_parses
 
@@ -3134,7 +3250,8 @@ async def run_parsing_job(
                 f"{method_line}"
                 f"📡 Каналов: <b>{len(channels)}</b>{accounts_line}\n"
                 f"{posts_line}"
-                f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n\n"
+                f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n"
+                f"{_views_status_line(views_filter)}\n"
                 "Это может занять несколько минут…",
                 parse_mode="HTML",
             )
@@ -3196,7 +3313,7 @@ async def run_parsing_job(
                                 ch, min_subs, max_subs,
                                 client=worker_client, seen_users=seen_users, tracker=tracker,
                                 channel_idx=idx, channels_total=len(channels),
-                                on_new_results=on_new_results,
+                                on_new_results=on_new_results, views_filter=views_filter,
                             ),
                             timeout=channel_timeout,
                         )
@@ -3208,6 +3325,7 @@ async def run_parsing_job(
                                 channel_idx=idx, channels_total=len(channels),
                                 on_new_results=on_new_results,
                                 also_check_gift_givers=(method == SEARCH_METHOD_DEEP),
+                                views_filter=views_filter,
                             ),
                             timeout=channel_timeout,
                         )
@@ -3295,12 +3413,17 @@ async def _finalize_and_report(
                 channel_link = f"https://t.me/{html.escape(r['channel'])}"
                 bio = html.escape(r['bio'][:150])
                 found_when = fmt_datetime(r.get('found_at', time.time()))
+                views_text = (
+                    f"👁 Просмотры последнего поста: <b>{r['last_post_views']:,}</b>\n"
+                    if r.get('last_post_views') is not None else ""
+                )
 
                 report_entries.append(
                     f"{status_icon} <b>{i}. {name}</b> ({uname})\n"
                     f"👤 Профиль: {person_link}\n"
                     f"📢 Канал: {channel_link}\n"
                     f"👥 Подписчиков: <b>{r['subscribers']:,}</b>\n"
+                    f"{views_text}"
                     f"🕒 Найден: {found_when}\n"
                     f"📝 Био: {bio}{'...' if len(r['bio']) > 150 else ''}\n"
                 )
@@ -3326,6 +3449,7 @@ async def run_keyword_job(
     keyword: str, min_subs: int, max_subs: int, trial_note: str | None = None,
     *, clients: list[TelegramClient] | None = None,
     notify_chat: bool = True, on_progress: "callable | None" = None,
+    views_filter: "tuple[int, int] | None" = None,
 ):
     """Способ "по ключевой фразе" — глобальный поиск, каналов/распределения по
     аккаунтам тут нет (это одна операция, не набор независимых каналов), поэтому
@@ -3371,7 +3495,8 @@ async def run_keyword_job(
                 chat_id,
                 f"⚡️ <b>Запускаю поиск по фразе</b>{trial_line}\n\n"
                 f"🔑 Фраза: <b>{html.escape(keyword)}</b>\n"
-                f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n\n"
+                f"👥 Подписчики: <b>{min_subs:,} – {max_subs:,}</b>\n"
+                f"{_views_status_line(views_filter)}\n"
                 "Это может занять несколько минут…",
                 parse_mode="HTML",
             )
@@ -3405,7 +3530,7 @@ async def run_keyword_job(
                 find_via_keyword(
                     keyword, min_subs, max_subs,
                     client=client, seen_channels=seen_channels, tracker=tracker,
-                    on_new_results=on_new_results,
+                    on_new_results=on_new_results, views_filter=views_filter,
                 ),
                 timeout=900,
             )
@@ -3733,6 +3858,7 @@ async def main():
             CHANNELS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_channels)],
             POSTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_posts)],
             SUBS_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_subs_range)],
+            VIEWS_RANGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_views_range)],
             BROADCAST_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_selection)],
             BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_text)],
             BROADCAST_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, connect_broadcast_confirm)],
