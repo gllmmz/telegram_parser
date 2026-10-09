@@ -24,7 +24,6 @@ import bot as botmod
 
 INITDATA_MAX_AGE = 24 * 3600  # старше суток initData не принимаем (защита от повторного использования утёкшей ссылки)
 JOB_TTL_SECONDS = 3600  # завершённые джобы старше часа чистим из памяти при создании новых
-MAX_CHANNELS_PER_JOB = 30
 CHANNEL_RE = re.compile(r'^(?:https?://)?(?:t\.me/|telegram\.me/)?@?[a-zA-Z0-9_]{4,32}/?$')
 
 
@@ -233,8 +232,9 @@ def create_app(bot) -> FastAPI:
             channels = list(dict.fromkeys(c.strip().lstrip('@') for c in body.channels if c.strip()))
             if not channels:
                 raise HTTPException(400, "Не указаны каналы")
-            if len(channels) > MAX_CHANNELS_PER_JOB:
-                raise HTTPException(400, f"Слишком много каналов за раз (максимум {MAX_CHANNELS_PER_JOB})")
+            limit = botmod.max_channels_for(user_id)
+            if len(channels) > limit:
+                raise HTTPException(400, botmod.channels_limit_message(len(channels), limit))
             invalid = [c for c in channels if not CHANNEL_RE.match(c)]
             if invalid:
                 raise HTTPException(400, f"Некорректный формат канала: {', '.join(invalid[:5])}")

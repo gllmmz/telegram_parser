@@ -85,7 +85,7 @@ MAX_CONCURRENT_PARSES = 8
 GRACEFUL_SHUTDOWN_TIMEOUT = 600  # сколько ждём завершения активных парсингов при рестарте/деплое (сек)
 CALL_TIMEOUT = 60
 MAX_FLOOD_WAIT = 120
-MAX_CHANNELS_PER_PARSE = 30  # тот же лимит, что и в мини-аппе (miniapp_api.MAX_CHANNELS_PER_JOB)
+MAX_CHANNELS_PER_PARSE = 30  # общий потолок каналов за один запуск (и в боте, и в мини-аппе)
 
 # Все даты/время в текстах бота — по московскому времени, независимо от того, в какой
 # таймзоне физически стоит сервер (были случаи переезда между серверами в разных
@@ -327,6 +327,49 @@ async def save_access_async(data):
         await asyncio.to_thread(save_access, snapshot)
 
 access_grants = load_access()
+
+
+# Персональные ограничения "сколько каналов можно отправить в парсер за один запуск".
+# Выставляет только админ (/limit) и пользователю нигде не показываются — он видит
+# лишь общее сообщение об ограничении, если превысит свой лимит.
+CHANNEL_LIMITS_FILE = "channel_limits.json"
+limits_lock = asyncio.Lock()
+
+
+def load_channel_limits():
+    if os.path.exists(CHANNEL_LIMITS_FILE):
+        try:
+            with open(CHANNEL_LIMITS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_channel_limits(data):
+    with open(CHANNEL_LIMITS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+async def save_channel_limits_async(data):
+    async with limits_lock:
+        snapshot = copy.deepcopy(data)
+        await asyncio.to_thread(save_channel_limits, snapshot)
+
+channel_limits = load_channel_limits()
+
+
+def max_channels_for(user_id: int) -> int:
+    """Сколько каналов пользователь может отправить в парсер за раз: общий потолок
+    или его персональный лимит, если админ его выставил (выше общего потолка не бывает)."""
+    personal = channel_limits.get(str(user_id))
+    return min(personal, MAX_CHANNELS_PER_PARSE) if personal else MAX_CHANNELS_PER_PARSE
+
+
+def channels_limit_message(count: int, limit: int) -> str:
+    """Один и тот же текст для всех — не выдаёт, что у кого-то лимит персональный."""
+    return (
+        f"Слишком много каналов за раз ({count}) — действует общее ограничение сервиса: "
+        f"максимум {limit} за один запуск. Пришли поменьше или раздели на несколько запусков."
+    )
 
 
 def load_trial_usage():
@@ -2308,7 +2351,7 @@ async def start_reparse_select(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_message(
         chat_id,
         "Напиши номера через запятую и/или диапазоны (например: <code>1,3,5-9</code>) "
-        f"или слово «все» (максимум {MAX_CHANNELS_PER_PARSE} за раз).",
+        "или слово «все».",
         parse_mode="HTML",
         reply_markup=cancel_keyboard(),
     )
@@ -2334,10 +2377,10 @@ async def connect_reparse_selection(update: Update, context: ContextTypes.DEFAUL
         )
         return REPARSE_SELECT
 
-    if len(indices) > MAX_CHANNELS_PER_PARSE:
+    limit = max_channels_for(update.effective_user.id)
+    if len(indices) > limit:
         await update.message.reply_text(
-            f"⚠️ Выбрано слишком много ({len(indices)}) — максимум {MAX_CHANNELS_PER_PARSE} за раз. "
-            "Сократи список и пришли ещё раз.",
+            "⚠️ " + channels_limit_message(len(indices), limit),
             reply_markup=cancel_keyboard(),
         )
         return REPARSE_SELECT
@@ -2919,11 +2962,11 @@ async def get_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHANNELS
 
     links = list(dict.fromkeys(links))
-    if len(links) > MAX_CHANNELS_PER_PARSE:
+    limit = max_channels_for(update.effective_user.id)
+    if len(links) > limit:
         await parsing_step_reply(
             update, context,
-            f"Слишком много каналов за раз ({len(links)}) — максимум {MAX_CHANNELS_PER_PARSE}. "
-            "Пришли поменьше или раздели на несколько запусков.",
+            channels_limit_message(len(links), limit),
             reply_markup=cancel_keyboard(),
         )
         return CHANNELS
@@ -3643,6 +3686,62 @@ async def deduct_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"(не смог уведомить пользователя лично: {e})")
 
 
+async def limit_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/limit — тихое персональное ограничение числа каналов за один запуск парсера.
+    Пользователь НИКАК не уведомляется и нигде его не видит; упёршись в лимит, он
+    получает то же общее сообщение об ограничении сервиса, что и все остальные."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    args = context.args
+    if not args:
+        if not channel_limits:
+            await update.effective_message.reply_text(
+                "Персональных ограничений нет.\n\nФормат: /limit <user_id или @username> <1–"
+                f"{MAX_CHANNELS_PER_PARSE} или off>"
+            )
+        else:
+            lines = "\n".join(f"{uid} — {n}" for uid, n in channel_limits.items())
+            await update.effective_message.reply_text(f"Персональные ограничения (id — каналов за раз):\n{lines}")
+        return
+
+    usage = (
+        f"Формат: /limit <user_id или @username> <число 1–{MAX_CHANNELS_PER_PARSE}> — поставить, "
+        "/limit <user_id или @username> off — снять, /limit без аргументов — список."
+    )
+    if len(args) != 2:
+        await update.effective_message.reply_text(usage)
+        return
+
+    target_id, display_name, err = await resolve_user(args[0])
+    if err:
+        await update.effective_message.reply_text(f"❌ {err}")
+        return
+
+    value = args[1].lower()
+    if value in ("off", "0"):
+        if channel_limits.pop(str(target_id), None) is not None:
+            await save_channel_limits_async(channel_limits)
+            await update.effective_message.reply_text(
+                f"✅ Ограничение для {display_name} (id={target_id}) снято — действует общий лимит "
+                f"{MAX_CHANNELS_PER_PARSE}."
+            )
+        else:
+            await update.effective_message.reply_text(f"У {display_name} (id={target_id}) и так не было ограничения.")
+        return
+
+    if not value.isdigit() or not (1 <= int(value) <= MAX_CHANNELS_PER_PARSE):
+        await update.effective_message.reply_text(usage)
+        return
+
+    channel_limits[str(target_id)] = int(value)
+    await save_channel_limits_async(channel_limits)
+    await update.effective_message.reply_text(
+        f"✅ Для {display_name} (id={target_id}) стоит ограничение: {value} каналов за один запуск. "
+        "Пользователь об этом не уведомлён."
+    )
+
+
 async def disconnect_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/disconnect отключает СРАЗУ ВСЕ привязанные аккаунты пользователя. Точечно —
     один конкретный — через «🔗 Привязанные аккаунты» в меню."""
@@ -3760,6 +3859,7 @@ async def main():
     app.add_handler(CommandHandler("grant", grant_access))
     app.add_handler(CommandHandler("revoke", revoke_access))
     app.add_handler(CommandHandler("deduct", deduct_access))
+    app.add_handler(CommandHandler("limit", limit_channels))
     app.add_handler(CommandHandler("disconnect", disconnect_account))
     app.add_handler(MessageHandler(filters.Regex("^📁 Моя база каналов$"), my_database))
     app.add_handler(MessageHandler(filters.Regex("^👤 Аккаунт$"), account))

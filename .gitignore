@@ -11,3 +11,4 @@ access_grants.json
 trial_usage.json
 bot.log
 .login_state.json
+channel_limits.json
