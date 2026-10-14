@@ -12,3 +12,4 @@ trial_usage.json
 bot.log
 .login_state.json
 channel_limits.json
+known_users.json

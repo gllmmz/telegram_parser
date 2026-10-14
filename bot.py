@@ -33,7 +33,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardR
 from telegram.error import TimedOut, NetworkError
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler
+    ContextTypes, ConversationHandler, TypeHandler
 )
 
 # ================== НАСТРОЙКИ ==================
@@ -328,6 +328,48 @@ async def save_access_async(data):
         await asyncio.to_thread(save_access, snapshot)
 
 access_grants = load_access()
+
+
+# Все, кто хоть раз писал боту: username (в нижнем регистре) -> {id, name}. Нужно, чтобы
+# админские команды (/grant, /limit...) находили человека по @username без запросов к
+# Telegram: поиск username через служебные аккаунты упирается в многочасовой FloodWait.
+KNOWN_USERS_FILE = "known_users.json"
+known_users_lock = asyncio.Lock()
+
+
+def load_known_users():
+    if os.path.exists(KNOWN_USERS_FILE):
+        try:
+            with open(KNOWN_USERS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_known_users(data):
+    with open(KNOWN_USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+async def save_known_users_async(data):
+    async with known_users_lock:
+        snapshot = copy.deepcopy(data)
+        await asyncio.to_thread(save_known_users, snapshot)
+
+known_users = load_known_users()
+
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запоминает username и id автора любого апдейта (отдельная группа хендлеров —
+    другим хендлерам не мешает). Файл пишем только когда запись новая или изменилась."""
+    user = update.effective_user
+    if user is None or user.is_bot or not user.username:
+        return
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip() or f"@{user.username}"
+    entry = {"id": user.id, "name": name}
+    key = user.username.lower()
+    if known_users.get(key) != entry:
+        known_users[key] = entry
+        await save_known_users_async(known_users)
 
 
 # Персональные ограничения "сколько каналов можно отправить в парсер за один запуск".
@@ -691,6 +733,9 @@ async def resolve_user(identifier: str) -> tuple[int | None, str | None, str | N
     identifier = identifier.strip().lstrip('@')
     if identifier.isdigit():
         return int(identifier), identifier, None
+    known = known_users.get(identifier.lower())
+    if known is not None:
+        return known["id"], known["name"], None
     if not telethon_clients:
         return None, None, "Нет доступных аккаунтов для поиска по username. Укажи числовой user_id."
 
@@ -710,6 +755,12 @@ async def resolve_user(identifier: str) -> tuple[int | None, str | None, str | N
         name = f"{entity.first_name or ''} {entity.last_name or ''}".strip() or f"@{identifier}"
         return entity.id, name, None
 
+    if isinstance(last_error, FloodWaitError):
+        return None, None, (
+            f"Telegram временно ограничил поиск по username у служебных аккаунтов "
+            f"(ещё ~{max(1, last_error.seconds // 3600)} ч). Укажи числовой user_id, либо "
+            f"попроси @{identifier} сначала нажать /start у бота — после этого он найдётся по @username."
+        )
     return None, None, f"Не удалось найти @{identifier}: {last_error}"
 
 
@@ -3942,6 +3993,7 @@ async def main():
         ],
         allow_reentry=True,
     )
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(conv_handler)
 
     app.add_handler(CommandHandler("status", account))
