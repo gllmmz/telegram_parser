@@ -684,6 +684,31 @@ class AccountSessionDead(Exception):
     """Личный аккаунт пользователя больше не авторизован (см. DEAD_SESSION_ERRORS)."""
 
 
+class AccountFlooded(Exception):
+    """Личный аккаунт пользователя упёрся в долгий FloodWait на поиске каналов по
+    username (лимит самого Telegram) — сейчас он работать не может, но сессия жива."""
+    def __init__(self, seconds: int):
+        super().__init__(f"FloodWait {seconds}s")
+        self.seconds = seconds
+
+
+def client_slot(client: TelegramClient) -> int | None:
+    """Номер слота пользовательского аккаунта по клиенту (None — клиент не из пользовательских)."""
+    for (_, slot), c in list(_user_clients.items()):
+        if c is client:
+            return slot
+    return None
+
+
+def flood_account_warning(slot: "int | None", seconds: int) -> str:
+    who = f"Аккаунт №{slot}" if slot else "Один из аккаунтов"
+    return (
+        f"{who} временно ограничен Telegram на поиск каналов по username "
+        f"(ещё ~{max(1, round(seconds / 3600))} ч). Это лимит самого Telegram, не ошибка бота — "
+        "аккаунт вернётся в работу сам. Пока можно использовать другие привязанные аккаунты."
+    )
+
+
 async def drop_dead_session(client: TelegramClient) -> tuple[int, int] | None:
     """Убирает мёртвую сессию личного аккаунта: из кэша живых клиентов и с диска —
     иначе Telethon продолжает считать её авторизованной (кэширует результат
@@ -822,12 +847,29 @@ def _forget_client_tracking(client: TelegramClient):
     client_subs_flood_until.pop(id(client), None)
 
 
+async def get_entity_cached_first(client: TelegramClient, username: str):
+    """get_entity по username, но сначала дисковый кэш сессии: для каналов, которые
+    аккаунт уже видел (например, личные каналы из профилей — они приходят в ответе
+    GetFullUser), access_hash известен, и ResolveUsernameRequest не нужен. У него жёсткий
+    суточный лимит и многочасовой FloodWait, а get_entity(username) бьёт именно в него."""
+    try:
+        input_peer = client.session.get_input_entity(username)
+    except (ValueError, AttributeError):
+        return await client.get_entity(username)
+    try:
+        return await client.get_entity(input_peer)
+    except FloodWaitError:
+        raise
+    except Exception:
+        return await client.get_entity(username)
+
+
 async def get_channel_subscribers(username: str, client: TelegramClient) -> int | None:
     flood_until = client_subs_flood_until.get(id(client))
     if flood_until and time.time() < flood_until:
         return None
     try:
-        entity = await with_timeout(client.get_entity(username), f"get_entity({username})")
+        entity = await with_timeout(get_entity_cached_first(client, username), f"get_entity({username})")
         if isinstance(entity, Channel) and entity.broadcast:
             full = await with_timeout(client(GetFullChannelRequest(entity)), f"GetFullChannel({username})")
             return full.full_chat.participants_count
@@ -1173,13 +1215,18 @@ async def parse_channel(
     if client_pool.clients:
         candidates = [client] + [c for c in client_pool.clients if c is not client]
 
+    user_flood_wait = 0  # сколько ещё секунд аккаунт пользователя в долгом FloodWait
     for candidate in candidates:
         flood_until = client_subs_flood_until.get(id(candidate))
         if flood_until and time.time() < flood_until:
+            if candidate is user_client:
+                user_flood_wait = int(flood_until - time.time())
             continue
         try:
             await ensure_connected(candidate, client_pool.label_for(candidate))
-            entity = await with_timeout(candidate.get_entity(channel_link), f"get_entity(@{channel_link})")
+            entity = await with_timeout(
+                get_entity_cached_first(candidate, channel_link), f"get_entity(@{channel_link})"
+            )
             client = candidate
             break
         except (UsernameNotOccupiedError, ChannelPrivateError, ValueError) as e:
@@ -1187,6 +1234,8 @@ async def parse_channel(
             break
         except FloodWaitError as e:
             last_error = e
+            if candidate is user_client and e.seconds > MAX_FLOOD_WAIT:
+                user_flood_wait = e.seconds
             if e.seconds > MAX_FLOOD_WAIT:
                 client_subs_flood_until[id(candidate)] = time.time() + e.seconds
             continue
@@ -1197,6 +1246,10 @@ async def parse_channel(
             continue
 
     if entity is None:
+        if user_flood_wait > MAX_FLOOD_WAIT:
+            # Не "канал не открылся", а сам аккаунт сейчас ограничен Telegram — пусть
+            # им займутся выше: канал вернётся в очередь для других аккаунтов.
+            raise AccountFlooded(user_flood_wait)
         print(f"❌ @{channel_link}: не удалось открыть канал: {last_error}")
         return [], [], f"❌ Не удалось открыть канал: {last_error}"
 
@@ -3370,6 +3423,15 @@ async def run_parsing_job(
                         live_clients.remove(worker_client)
                     channel_queue.put_nowait((idx, ch))
                     return
+                except AccountFlooded as e:
+                    # Аккаунт временно ограничен Telegram: сессию не трогаем, но на этот
+                    # запуск он выбывает, а канал достаётся остальным аккаунтам.
+                    print(f"⚠️ @{ch}: аккаунт в FloodWait на {e.seconds}s — выходит из этого запуска")
+                    warnings.append(flood_account_warning(client_slot(worker_client), e.seconds))
+                    if worker_client in live_clients:
+                        live_clients.remove(worker_client)
+                    channel_queue.put_nowait((idx, ch))
+                    return
                 except asyncio.TimeoutError:
                     print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
                     results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
@@ -3389,8 +3451,16 @@ async def run_parsing_job(
 
         while not channel_queue.empty():
             idx, ch = channel_queue.get_nowait()
-            debug_info[idx - 1] = f"@{ch}: ❌ Не обработан — ни один из выбранных аккаунтов не авторизован"
+            debug_info[idx - 1] = f"@{ch}: ❌ Не обработан — выбранные аккаунты сейчас не могут работать (см. предупреждение)"
             await tracker.channel_done()
+
+        # Аккаунты, упёршиеся в лимит поиска уже в ходе работы (подписчики каналов из
+        # био тоже ищутся по username): парсинг дошёл до конца, но часть каналов
+        # могла остаться непроверенной — скажем об этом, а не промолчим.
+        for c in live_clients:
+            flood_until = client_subs_flood_until.get(id(c))
+            if flood_until and time.time() < flood_until:
+                warnings.append(flood_account_warning(client_slot(c), int(flood_until - time.time())))
 
         if warnings and notify_chat:
             await context.bot.send_message(chat_id, "⚠️ " + "\n".join(dict.fromkeys(warnings)))
