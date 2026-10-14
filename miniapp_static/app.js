@@ -330,6 +330,11 @@
             document.getElementById("parsing-done").style.display = "block";
             document.getElementById("pd-found").textContent = "Найдено: " + (job.found || 0);
 
+            var warnEl = document.getElementById("pd-warnings");
+            var warnings = job.warnings || [];
+            warnEl.innerHTML = warnings.map(function (w) { return "⚠️ " + esc(w); }).join("<br>");
+            warnEl.style.display = warnings.length ? "block" : "none";
+
             var results = job.results || [];
             document.getElementById("pd-results").innerHTML = results.length
               ? results.map(renderFoundItem).join("")

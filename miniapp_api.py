@@ -137,6 +137,9 @@ def create_app(bot) -> FastAPI:
                     if name:
                         label = name
                     premium = bool(getattr(me, 'premium', False))
+                except botmod.DEAD_SESSION_ERRORS:
+                    await botmod.drop_dead_session(client)
+                    continue
                 except Exception:
                     pass
             out.append({"slot": slot, "label": label, "premium": premium})
@@ -339,6 +342,7 @@ def create_app(bot) -> FastAPI:
                 active_jobs[job_id]["status"] = "done"
                 active_jobs[job_id]["results"] = (outcome or {}).get("results", [])
                 active_jobs[job_id]["rejected"] = (outcome or {}).get("rejected", [])
+                active_jobs[job_id]["warnings"] = (outcome or {}).get("warnings", [])
             except Exception as e:
                 active_jobs[job_id]["status"] = "error"
                 active_jobs[job_id]["error"] = str(e)

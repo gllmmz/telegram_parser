@@ -25,7 +25,8 @@ from telethon.errors import (
     FloodWaitError, ChannelPrivateError, UsernameNotOccupiedError,
     MsgIdInvalidError, PhoneNumberInvalidError, PhoneCodeInvalidError,
     PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError,
-    PeerFloodError,
+    PeerFloodError, AuthKeyUnregisteredError, AuthKeyInvalidError, AuthKeyDuplicatedError,
+    SessionRevokedError, SessionExpiredError, UserDeactivatedError, UserDeactivatedBanError,
 )
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
@@ -628,6 +629,49 @@ async def disconnect_user_client(user_id: int, slot: int | None = None):
             _forget_client_tracking(client)
 
 
+# Ошибки, после которых сессия (auth key) навсегда непригодна: Telegram её отозвал,
+# пользователь завершил сеанс на устройстве, ключ использовали с двух IP или
+# аккаунт удалён/забанен. Повторять запрос бессмысленно — нужна новая привязка.
+DEAD_SESSION_ERRORS = (
+    AuthKeyUnregisteredError, AuthKeyInvalidError, AuthKeyDuplicatedError,
+    SessionRevokedError, SessionExpiredError, UserDeactivatedError, UserDeactivatedBanError,
+)
+
+
+class AccountSessionDead(Exception):
+    """Личный аккаунт пользователя больше не авторизован (см. DEAD_SESSION_ERRORS)."""
+
+
+async def drop_dead_session(client: TelegramClient) -> tuple[int, int] | None:
+    """Убирает мёртвую сессию личного аккаунта: из кэша живых клиентов и с диска —
+    иначе Telethon продолжает считать её авторизованной (кэширует результат
+    is_user_authorized), а в списке «Привязанные аккаунты» она висит как рабочая.
+    Возвращает (user_id, слот) или None, если клиент не из пользовательских."""
+    owner = None
+    async with _user_clients_lock:
+        for key, c in list(_user_clients.items()):
+            if c is client:
+                owner = key
+                del _user_clients[key]
+                break
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    _forget_client_tracking(client)
+    if owner is not None:
+        _remove_session_files(*owner)
+        print(f"🗑 Мёртвая сессия аккаунта (user={owner[0]}, слот {owner[1]}) удалена")
+    return owner
+
+
+def dead_account_warning(slot: int) -> str:
+    return (
+        f"Аккаунт №{slot} больше не авторизован в Telegram (сеанс завершён или отозван), "
+        "поэтому он отключён. Привяжи его заново: «🔗 Привязанные аккаунты»."
+    )
+
+
 async def create_login_client(user_id: int, slot: int) -> TelegramClient:
     """Создаёт (или пересоздаёт) клиент для процесса входа в указанный слот.
     Старую сессию этого слота сбрасываем."""
@@ -1072,6 +1116,7 @@ async def parse_channel(
 
     entity = None
     last_error: object = "не удалось открыть канал"
+    user_client = client  # аккаунт пользователя; ниже client может смениться на общий из пула
     # Для личного аккаунта пул может быть пуст — пробуем только переданный client
     candidates = [client]
     if client_pool.clients:
@@ -1095,6 +1140,8 @@ async def parse_channel(
                 client_subs_flood_until[id(candidate)] = time.time() + e.seconds
             continue
         except Exception as e:
+            if candidate is user_client and isinstance(e, DEAD_SESSION_ERRORS):
+                raise AccountSessionDead(f"@{channel_link}: {type(e).__name__}") from e
             last_error = e
             continue
 
@@ -1109,6 +1156,8 @@ async def parse_channel(
             client.get_messages(entity, limit=posts_limit), f"get_messages(@{channel_link})"
         )
     except Exception as e:
+        if client is user_client and isinstance(e, DEAD_SESSION_ERRORS):
+            raise AccountSessionDead(f"@{channel_link}: {type(e).__name__}") from e
         print(f"❌ @{channel_link}: не удалось получить посты: {e}")
         return [], [], f"❌ Не удалось получить посты: {e}"
     posts_in_channel = len(messages)
@@ -2123,6 +2172,9 @@ async def _connected_accounts_summary(user_id: int) -> list[tuple[int, str]]:
                 name = f"{me.first_name or ''} {me.last_name or ''}".strip() or f"аккаунт №{slot}"
                 premium = " ⭐Premium" if getattr(me, 'premium', False) else ""
                 label = f"{name}{premium}"
+            except DEAD_SESSION_ERRORS:
+                await drop_dead_session(client)
+                continue
             except Exception:
                 pass
         out.append((slot, label))
@@ -2223,6 +2275,8 @@ async def select_parse_accounts(update: Update, context: ContextTypes.DEFAULT_TY
                 me = await c.get_me()
                 if getattr(me, 'premium', False):
                     premium_clients.append(c)
+            except DEAD_SESSION_ERRORS:
+                await drop_dead_session(c)
             except Exception:
                 pass
         if not premium_clients:
@@ -2822,6 +2876,9 @@ async def show_linked_accounts(update: Update, context: ContextTypes.DEFAULT_TYP
                 name = f"{me.first_name or ''} {me.last_name or ''}".strip() or "аккаунт"
                 uname = f"@{me.username}" if me.username else f"id{me.id}"
                 lines.append(f"{slot}. ✅ {html.escape(name)} ({html.escape(uname)})\n")
+            except DEAD_SESSION_ERRORS:
+                await drop_dead_session(client)
+                lines.append(f"{slot}. ⚠️ сессия отозвана в Telegram — привяжи аккаунт заново\n")
             except Exception:
                 lines.append(f"{slot}. ✅ аккаунт №{slot} (подключён)\n")
         else:
@@ -3224,6 +3281,9 @@ async def run_parsing_job(
         for idx, ch in enumerate(channels, 1):
             channel_queue.put_nowait((idx, ch))
 
+        live_clients = list(clients)
+        warnings: list[str] = []
+
         async def channel_worker(worker_client: TelegramClient):
             while True:
                 try:
@@ -3246,6 +3306,19 @@ async def run_parsing_job(
                         ),
                         timeout=channel_timeout,
                     )
+                except AccountSessionDead as e:
+                    # Сессия этого аккаунта отозвана в Telegram: убираем её, канал
+                    # возвращаем в очередь для живых аккаунтов, а сам воркер выходит.
+                    print(f"⚠️ {e}: сессия личного аккаунта мертва")
+                    owner = await drop_dead_session(worker_client)
+                    warnings.append(
+                        dead_account_warning(owner[1]) if owner
+                        else "Один из аккаунтов больше не авторизован в Telegram."
+                    )
+                    if worker_client in live_clients:
+                        live_clients.remove(worker_client)
+                    channel_queue.put_nowait((idx, ch))
+                    return
                 except asyncio.TimeoutError:
                     print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
                     results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
@@ -3256,12 +3329,24 @@ async def run_parsing_job(
 
         # Один воркер на каждый доступный аккаунт — каналы разбираются из общей
         # очереди, так что при нескольких аккаунтах несколько каналов обрабатываются
-        # параллельно (каждый своим аккаунтом), а не строго один за другим.
-        await asyncio.gather(*(channel_worker(c) for c in clients))
+        # параллельно (каждый своим аккаунтом), а не строго один за другим. Если
+        # воркер вышел из-за мёртвой сессии, его канал остался в очереди — следующий
+        # круг доделают оставшиеся живые аккаунты (каждый круг либо опустошает очередь,
+        # либо убирает хотя бы один аккаунт, так что цикл конечен).
+        while not channel_queue.empty() and live_clients:
+            await asyncio.gather(*(channel_worker(c) for c in list(live_clients)))
+
+        while not channel_queue.empty():
+            idx, ch = channel_queue.get_nowait()
+            debug_info[idx - 1] = f"@{ch}: ❌ Не обработан — ни один из выбранных аккаунтов не авторизован"
+            await tracker.channel_done()
+
+        if warnings and notify_chat:
+            await context.bot.send_message(chat_id, "⚠️ " + "\n".join(dict.fromkeys(warnings)))
 
         return await _finalize_and_report(
             context, chat_id, user_id_str, all_results, all_filtered_out, debug_info,
-            pairs_before_job, tracker, notify_chat,
+            pairs_before_job, tracker, notify_chat, warnings=list(dict.fromkeys(warnings)),
         )
     finally:
         active_parses -= 1
@@ -3271,6 +3356,7 @@ async def _finalize_and_report(
     context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id_str: str,
     all_results: list, all_filtered_out: list, debug_info: list,
     pairs_before_job: set, tracker: "ProgressTracker", notify_chat: bool,
+    warnings: "list[str] | None" = None,
 ) -> dict:
     """Общий хвост для run_parsing_job/run_keyword_job: сохранить кэши, посчитать
     итог, разослать отчёт в чат (если notify_chat) — не зависит от способа поиска."""
@@ -3358,7 +3444,7 @@ async def _finalize_and_report(
         # Каналы, не прошедшие фильтр по подписчикам, пользователю не показываем —
         # это шум, не относящийся к результату по заданным критериям.
 
-    return {'results': unique, 'rejected': rejected_list}
+    return {'results': unique, 'rejected': rejected_list, 'warnings': warnings or []}
 
 
 async def run_keyword_job(
@@ -3399,6 +3485,12 @@ async def run_keyword_job(
                     reply_markup=main_menu_keyboard(),
                 )
             return {'results': [], 'rejected': []}
+    except DEAD_SESSION_ERRORS:
+        owner = await drop_dead_session(client)
+        warning = dead_account_warning(owner[1]) if owner else "Аккаунт больше не авторизован в Telegram."
+        if notify_chat:
+            await context.bot.send_message(chat_id, f"⚠️ {warning}", reply_markup=main_menu_keyboard())
+        return {'results': [], 'rejected': [], 'warnings': [warning]}
     except Exception:
         pass
 
