@@ -3394,21 +3394,17 @@ async def run_parsing_job(
                     idx, ch = channel_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     return
-                # "Через подарки" и "углублённый поиск" делают доп. запросы (подарки) на
-                # каждого комментатора — даём заметно больше времени на канал.
+                # Общего лимита по времени на канал нет: большой канал просто идёт, сколько
+                # нужно. От зависания защищают таймауты отдельных запросов к Telegram.
                 with_gifts = method in (SEARCH_METHOD_GIFTS, SEARCH_METHOD_DEEP)
-                channel_timeout = max(600, posts * 60) if with_gifts else max(300, posts * 30)
                 try:
-                    results, filtered_out, info = await asyncio.wait_for(
-                        parse_channel(
-                            ch, posts, min_subs, max_subs,
-                            client=worker_client, seen_users=seen_users, tracker=tracker,
-                            channel_idx=idx, channels_total=len(channels),
-                            on_new_results=on_new_results,
-                            also_check_gift_givers=with_gifts,
-                            views_filter=views_filter,
-                        ),
-                        timeout=channel_timeout,
+                    results, filtered_out, info = await parse_channel(
+                        ch, posts, min_subs, max_subs,
+                        client=worker_client, seen_users=seen_users, tracker=tracker,
+                        channel_idx=idx, channels_total=len(channels),
+                        on_new_results=on_new_results,
+                        also_check_gift_givers=with_gifts,
+                        views_filter=views_filter,
                     )
                 except AccountSessionDead as e:
                     # Сессия этого аккаунта отозвана в Telegram: убираем её, канал
@@ -3432,9 +3428,6 @@ async def run_parsing_job(
                         live_clients.remove(worker_client)
                     channel_queue.put_nowait((idx, ch))
                     return
-                except asyncio.TimeoutError:
-                    print(f"⚠️ @{ch}: общий таймаут канала ({channel_timeout}s), пропускаю")
-                    results, filtered_out, info = [], [], f"❌ Таймаут обработки канала ({channel_timeout}s)"
                 await tracker.channel_done()
                 all_results.extend(results)
                 all_filtered_out.extend(filtered_out)
