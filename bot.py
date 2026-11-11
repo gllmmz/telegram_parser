@@ -27,7 +27,9 @@ from telethon.errors import (
     PhoneCodeExpiredError, SessionPasswordNeededError, PasswordHashInvalidError,
     PeerFloodError, AuthKeyUnregisteredError, AuthKeyInvalidError, AuthKeyDuplicatedError,
     SessionRevokedError, SessionExpiredError, UserDeactivatedError, UserDeactivatedBanError,
+    SendCodeUnavailableError, PhoneNumberFloodError, PhoneNumberBannedError,
 )
+from telethon.tl.functions.auth import ResendCodeRequest
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, BotCommand
 from telegram.error import TimedOut, NetworkError
@@ -1662,14 +1664,18 @@ def views_range_keyboard():
     )
 
 
+RESEND_CODE_BUTTON = "📩 Другим способом"
+
+
 def code_keyboard():
-    """Цифровая клавиатура 0–9 + стереть + отмена."""
+    """Цифровая клавиатура 0–9 + стереть + отмена + повторная отправка кода."""
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("1"), KeyboardButton("2"), KeyboardButton("3")],
             [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
             [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")],
             [KeyboardButton("⌫"), KeyboardButton("0"), KeyboardButton("❌ Отмена")],
+            [KeyboardButton(RESEND_CODE_BUTTON)],
         ],
         resize_keyboard=True,
     )
@@ -1722,12 +1728,44 @@ def _code_slots_html(digits: list[str], length: int = 5) -> str:
     return "  ".join(slots)
 
 
-def code_prompt_text(digits: list[str], length: int = 5) -> str:
+_CODE_TYPE_TEXT = {
+    'SentCodeTypeApp': "в приложение Telegram — сообщением от «Telegram» на устройстве, где этот аккаунт уже открыт",
+    'SentCodeTypeSms': "по SMS на этот номер",
+    'SentCodeTypeCall': "голосовым звонком на этот номер",
+    'SentCodeTypeFlashCall': "звонком-сбросом (код — последние цифры номера звонившего)",
+    'SentCodeTypeMissedCall': "пропущенным звонком (код — последние цифры номера звонившего)",
+    'SentCodeTypeFragmentSms': "по SMS через Fragment (анонимный номер)",
+    'SentCodeTypeEmailCode': "на почту, привязанную к аккаунту",
+}
+_NEXT_CODE_TYPE_TEXT = {
+    'CodeTypeSms': "по SMS",
+    'CodeTypeCall': "звонком",
+    'CodeTypeFlashCall': "звонком-сбросом",
+    'CodeTypeMissedCall': "пропущенным звонком",
+    'CodeTypeFragmentSms': "по SMS через Fragment",
+}
+
+
+def code_delivery_hint(sent) -> str:
+    """Куда Telegram реально отправил код (по sent.type) и чем можно продублировать
+    (sent.next_type) — чтобы человек не искал код не там и знал про кнопку повтора."""
+    where = _CODE_TYPE_TEXT.get(type(sent.type).__name__)
+    lines = [f"Код отправлен {where}." if where else "Код отправлен."]
+    nxt = _NEXT_CODE_TYPE_TEXT.get(type(getattr(sent, 'next_type', None)).__name__)
+    if nxt:
+        timeout = getattr(sent, 'timeout', None)
+        wait = f" через {timeout} сек." if timeout else ""
+        lines.append(f"Не пришёл? Нажми «{RESEND_CODE_BUTTON}»{wait} — отправим {nxt}.")
+    return "\n".join(lines)
+
+
+def code_prompt_text(digits: list[str], length: int = 5, hint: str = "") -> str:
+    info = html.escape(hint) if hint else "Код пришёл в приложение Telegram или по SMS."
     return (
         "🔐 <b>Введите код из Telegram</b>\n\n"
         f"{_code_slots_html(digits, length)}\n\n"
-        "Код пришёл в приложение Telegram или по SMS.\n"
-        "Нажимайте цифры на клавиатуре ниже."
+        f"{info}\n"
+        "Нажимайте цифры на клавиатуре ниже или пришлите код одним сообщением."
     )
 
 
@@ -1889,6 +1927,21 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['login_client'] = client  # держим до sign_in
         context.user_data['code_digits'] = []
         context.user_data['code_length'] = code_length
+        code_hint = code_delivery_hint(sent)
+        context.user_data['code_hint'] = code_hint
+    except PhoneNumberFloodError:
+        await status.edit_text(
+            "⏳ Слишком много попыток для этого номера — Telegram временно запретил отправку кодов. "
+            "Подожди несколько часов и попробуй снова."
+        )
+        await context.bot.send_message(chat_id, "Нажми /start, когда сможешь.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    except PhoneNumberBannedError:
+        await status.edit_text("❌ Этот номер заблокирован в Telegram — привязать его нельзя.")
+        await context.bot.send_message(
+            chat_id, "Попробуй другой номер.", reply_markup=connect_phone_keyboard(),
+        )
+        return CONNECT_PHONE
     except PhoneNumberInvalidError:
         await status.edit_text("❌ Неверный номер телефона. Попробуй ещё раз.")
         await context.bot.send_message(
@@ -1919,7 +1972,7 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code_msg = await context.bot.send_message(
         chat_id,
-        code_prompt_text([], code_length),
+        code_prompt_text([], code_length, code_hint),
         parse_mode="HTML",
         reply_markup=code_keyboard(),
     )
@@ -1952,6 +2005,50 @@ async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
+
+    if text == RESEND_CODE_BUTTON:
+        phone = context.user_data.get('login_phone')
+        phone_code_hash = context.user_data.get('login_phone_code_hash')
+        client: TelegramClient | None = context.user_data.get('login_client')
+        if not client or not phone or not phone_code_hash:
+            await context.bot.send_message(chat_id, "❌ Сессия входа потеряна. Начни заново — /start")
+            await _cleanup_login(context, user_id)
+            return ConversationHandler.END
+
+        extra = ""
+        try:
+            sent = await client(ResendCodeRequest(phone_number=phone, phone_code_hash=phone_code_hash))
+        except SendCodeUnavailableError:
+            extra = ("\n\n⚠️ Других способов отправки для этого номера Telegram больше не даёт. "
+                     "Подожди несколько минут и начни заново (/start).")
+        except FloodWaitError as e:
+            extra = f"\n\n⏳ Telegram просит подождать {e.seconds} сек. перед повторной отправкой."
+        except PhoneCodeExpiredError:
+            await _cleanup_login(context, user_id)
+            context.user_data.pop('code_msg_id', None)
+            await context.bot.send_message(
+                chat_id, "❌ Код устарел. Начни заново — /start", reply_markup=ReplyKeyboardRemove(),
+            )
+            return ConversationHandler.END
+        except Exception as e:
+            print(f"❌ ResendCodeRequest: {type(e).__name__}: {e}")
+            extra = f"\n\n❌ Не удалось отправить код повторно: {e}"
+        else:
+            new_hash = getattr(sent, 'phone_code_hash', None)
+            if new_hash:
+                context.user_data['login_phone_code_hash'] = new_hash
+            sent_type = getattr(sent, 'type', None)
+            context.user_data['code_length'] = getattr(sent_type, 'length', None) or context.user_data.get('code_length', 5)
+            context.user_data['code_digits'] = []
+            if sent_type is not None:
+                context.user_data['code_hint'] = code_delivery_hint(sent)
+                print(
+                    f"📨 ResendCode для ...{phone[-4:]}: доставка {type(sent_type).__name__}, "
+                    f"длина кода {context.user_data['code_length']}"
+                )
+            extra = "\n\n📩 Код отправлен повторно."
+        await _update_code_message(context, chat_id, extra=extra)
+        return CONNECT_CODE
 
     digits: list[str] = context.user_data.setdefault('code_digits', [])
     code_length = context.user_data.get('code_length', 5)
@@ -2126,7 +2223,7 @@ async def _update_code_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     code_length = context.user_data.get('code_length', 5)
     if not code_msg_id:
         return
-    text = code_prompt_text(digits, code_length) + extra
+    text = code_prompt_text(digits, code_length, context.user_data.get('code_hint', '')) + extra
     try:
         await context.bot.edit_message_text(
             text,
@@ -2153,6 +2250,7 @@ async def _cleanup_login(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     context.user_data.pop('code_digits', None)
     context.user_data.pop('code_msg_id', None)
     context.user_data.pop('code_length', None)
+    context.user_data.pop('code_hint', None)
     context.user_data.pop('login_slot', None)
     # Неавторизованную сессию этого слота удаляем
     if not await is_slot_connected(user_id, slot):
