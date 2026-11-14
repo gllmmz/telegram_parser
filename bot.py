@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import html
+import io
 import random
 import re
 import json
@@ -1630,10 +1631,14 @@ def cancel_keyboard():
     return ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
 
 
+QR_LOGIN_BUTTON = "📷 Войти по QR-коду"
+
+
 def connect_phone_keyboard():
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton("📱 Отправить мой номер", request_contact=True)],
+            [KeyboardButton(QR_LOGIN_BUTTON)],
             [KeyboardButton("❌ Отмена")],
         ],
         resize_keyboard=True,
@@ -1675,7 +1680,7 @@ def code_keyboard():
             [KeyboardButton("4"), KeyboardButton("5"), KeyboardButton("6")],
             [KeyboardButton("7"), KeyboardButton("8"), KeyboardButton("9")],
             [KeyboardButton("⌫"), KeyboardButton("0"), KeyboardButton("❌ Отмена")],
-            [KeyboardButton(RESEND_CODE_BUTTON)],
+            [KeyboardButton(RESEND_CODE_BUTTON), KeyboardButton(QR_LOGIN_BUTTON)],
         ],
         resize_keyboard=True,
     )
@@ -1839,7 +1844,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Парсинг выполняется через ваш Telegram-аккаунт.\n"
             "Отправьте номер телефона в международном формате "
             "(например <code>+79001234567</code>) "
-            "или нажмите кнопку ниже.",
+            "или нажмите кнопку ниже.\n\n"
+            "Если код не приходит — нажмите «📷 Войти по QR-коду»: код не понадобится.",
             parse_mode="HTML",
             reply_markup=connect_phone_keyboard(),
         )
@@ -1871,12 +1877,25 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "❌ Отмена":
+        # Если в этот момент идёт ожидание QR (оно крутится в другом апдейте этого же
+        # диалога), гасим его и закрываем клиент входа.
+        if context.user_data.pop('qr_token', None) is not None:
+            qr_msg_id = context.user_data.pop('qr_msg_id', None)
+            if qr_msg_id:
+                try:
+                    await context.bot.delete_message(chat_id, qr_msg_id)
+                except Exception:
+                    pass
+            await _cleanup_login(context, user_id)
         await replace_last_message(
             update, context, 'start_msg_id',
             "Подключение отменено. Чтобы начать — /start",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
+
+    if text == QR_LOGIN_BUTTON:
+        return await connect_qr_login(update, context)
 
     # Номер из контакта или текстом
     phone = None
@@ -1980,6 +1999,191 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CONNECT_CODE
 
 
+QR_ROUND_SECONDS = 25  # токен QR живёт ~30 с; дальше выдаём новый
+QR_ROUNDS = 4          # итого ждём подтверждения около 100 секунд
+
+
+def make_qr_png(url: str) -> bytes | None:
+    """PNG с QR-кодом для url; None, если библиотека segno не установлена (тогда
+    вход всё равно возможен по ссылке)."""
+    try:
+        import segno
+    except ImportError:
+        return None
+    buf = io.BytesIO()
+    segno.make(url, error="m").save(buf, kind="png", scale=8, border=4)
+    return buf.getvalue()
+
+
+async def connect_qr_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вход без кода: бот показывает QR, человек сканирует его в Telegram на телефоне,
+    где аккаунт уже открыт (Настройки → Устройства → Подключить устройство). Помогает,
+    когда код не доходит — Telegram сам решает, куда слать код, и не всегда туда,
+    где его можно прочитать."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    slot = context.user_data.get('login_slot', 1)
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # Если пришли с экрана ввода кода — убираем его и прежний клиент входа.
+    code_msg_id = context.user_data.pop('code_msg_id', None)
+    if code_msg_id:
+        try:
+            await context.bot.delete_message(chat_id, code_msg_id)
+        except Exception:
+            pass
+    for key in ('code_digits', 'code_length', 'code_hint', 'login_phone', 'login_phone_code_hash'):
+        context.user_data.pop(key, None)
+    old_client = context.user_data.pop('login_client', None)
+    if old_client is not None:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+
+    status = await context.bot.send_message(chat_id, "⏳ Готовлю QR-код…")
+    try:
+        client = await create_login_client(user_id, slot)
+        qr = await client.qr_login()
+    except FloodWaitError as e:
+        await status.edit_text(f"⏳ Telegram просит подождать {e.seconds} сек. Попробуй позже.")
+        await context.bot.send_message(chat_id, "Нажми /start, когда сможешь.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    except Exception as e:
+        print(f"❌ qr_login: {type(e).__name__}: {e}")
+        await status.edit_text(f"❌ Не удалось создать QR-код: {e}")
+        await context.bot.send_message(
+            chat_id, "Попробуй ещё раз или войди по номеру телефона.", reply_markup=connect_phone_keyboard(),
+        )
+        return CONNECT_PHONE
+
+    token = object()
+    context.user_data['login_client'] = client  # чтобы «Отмена» могла его закрыть
+    context.user_data['qr_token'] = token
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    def cancelled() -> bool:
+        return context.user_data.get('qr_token') is not token
+
+    async def drop_client():
+        context.user_data.pop('login_client', None)
+        context.user_data.pop('qr_token', None)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    photo_msg = None
+    for _ in range(QR_ROUNDS):
+        if photo_msg is not None:
+            try:
+                await context.bot.delete_message(chat_id, photo_msg.message_id)
+            except Exception:
+                pass
+            photo_msg = None
+
+        caption = (
+            "📷 <b>Вход по QR-коду</b>\n\n"
+            "1. Откройте этот чат с ботом на <b>другом устройстве</b> (компьютер или второй "
+            "телефон), чтобы видеть QR-код.\n"
+            "2. На телефоне с нужным аккаунтом: <b>Настройки → Устройства → Подключить "
+            "устройство</b> и наведите камеру на QR.\n\n"
+            "QR обновляется каждые несколько секунд — сканируйте тот, что на экране. Жду подтверждения…"
+        )
+        png = make_qr_png(qr.url)
+        link_line = (
+            "\n\nЕсли подключаете тот же аккаунт, с которого пишете боту, просто нажмите: "
+            f'<a href="{html.escape(qr.url)}">войти этим аккаунтом</a>'
+        )
+        cancel_kb = ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True)
+        # Сначала со ссылкой; если Telegram не принял tg://login в тексте — без неё.
+        for with_link in (True, False):
+            text_out = caption + (link_line if with_link else "")
+            if png is None:
+                text_out += "\n\n⚠️ QR-картинку создать не удалось."
+            try:
+                if png is not None:
+                    photo_msg = await context.bot.send_photo(
+                        chat_id, photo=png, caption=text_out, parse_mode="HTML", reply_markup=cancel_kb,
+                    )
+                else:
+                    photo_msg = await context.bot.send_message(
+                        chat_id, text_out, parse_mode="HTML", reply_markup=cancel_kb,
+                    )
+                break
+            except Exception as e:
+                print(f"⚠️ не удалось отправить QR (со ссылкой={with_link}): {type(e).__name__}: {e}")
+        if photo_msg is not None:
+            context.user_data['qr_msg_id'] = photo_msg.message_id
+
+        try:
+            user = await qr.wait(timeout=QR_ROUND_SECONDS)
+        except asyncio.TimeoutError:
+            if cancelled():
+                return ConversationHandler.END
+            try:
+                await qr.recreate()
+            except Exception as e:
+                print(f"❌ qr.recreate: {type(e).__name__}: {e}")
+                break
+            continue
+        except SessionPasswordNeededError:
+            if cancelled():
+                return ConversationHandler.END
+            context.user_data.pop('qr_token', None)
+            if photo_msg is not None:
+                try:
+                    await context.bot.delete_message(chat_id, photo_msg.message_id)
+                except Exception:
+                    pass
+            await context.bot.send_message(
+                chat_id,
+                "🔐 На аккаунте включена двухфакторная защита.\n"
+                "Отправь пароль облачного пароля (2FA) текстом.\n\nВведи пароль 2FA:",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("❌ Отмена")]], resize_keyboard=True),
+            )
+            return CONNECT_PASSWORD
+        except Exception as e:
+            if cancelled():
+                return ConversationHandler.END
+            print(f"❌ qr.wait: {type(e).__name__}: {e}")
+            await drop_client()
+            await context.bot.send_message(
+                chat_id, f"❌ Не удалось войти по QR: {e}\nПопробуй ещё раз или войди по номеру.",
+                reply_markup=connect_phone_keyboard(),
+            )
+            return CONNECT_PHONE
+
+        # Подтверждение получено
+        if cancelled():
+            return ConversationHandler.END
+        context.user_data.pop('qr_token', None)
+        if photo_msg is not None:
+            try:
+                await context.bot.delete_message(chat_id, photo_msg.message_id)
+            except Exception:
+                pass
+        return await _finish_login(update, context, client, user_id)
+
+    # Время вышло, QR так и не отсканировали
+    if cancelled():
+        return ConversationHandler.END
+    await drop_client()
+    await context.bot.send_message(
+        chat_id,
+        "⌛ QR не отсканировали вовремя. Нажми «📷 Войти по QR-коду» ещё раз или войди по номеру телефона.",
+        reply_markup=connect_phone_keyboard(),
+    )
+    return CONNECT_PHONE
+
+
 async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -2005,6 +2209,9 @@ async def connect_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
+
+    if text == QR_LOGIN_BUTTON:
+        return await connect_qr_login(update, context)
 
     if text == RESEND_CODE_BUTTON:
         phone = context.user_data.get('login_phone')
@@ -3115,7 +3322,8 @@ async def start_add_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔌 <b>Подключение аккаунта №{slot}</b>\n\n"
         "Отправьте номер телефона в международном формате "
-        "(например <code>+79001234567</code>) или нажмите кнопку ниже.",
+        "(например <code>+79001234567</code>) или нажмите кнопку ниже.\n\n"
+        "Если код не приходит — нажмите «📷 Войти по QR-коду»: код не понадобится.",
         parse_mode="HTML",
         reply_markup=connect_phone_keyboard(),
     )

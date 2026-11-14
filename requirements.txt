@@ -4,3 +4,4 @@ python-dotenv==1.2.2
 fastapi>=0.115
 uvicorn[standard]>=0.34
 tzdata>=2024.1
+segno>=1.6
