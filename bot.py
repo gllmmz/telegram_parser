@@ -1930,6 +1930,15 @@ async def connect_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await context.bot.send_message(chat_id, "⏳ Отправляю код…")
     slot = context.user_data.get('login_slot', 1)
 
+    # Клиент прошлой попытки входа закрываем до того, как create_login_client удалит
+    # файл его сессии: иначе он остаётся подключённым и сыплет "readonly database".
+    old_client = context.user_data.pop('login_client', None)
+    if old_client is not None:
+        try:
+            await old_client.disconnect()
+        except Exception:
+            pass
+
     try:
         client = await create_login_client(user_id, slot)
         sent = await client.send_code_request(phone)
